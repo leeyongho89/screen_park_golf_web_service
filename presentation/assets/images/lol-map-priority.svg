@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-labelledby="title desc">
+  <title id="title">리그 오브 레전드 오브젝트 준비 우선순위</title>
+  <desc id="desc">오브젝트 교전 전에 라인 정리, 시야 확보, 선점, 교전 순서로 준비해야 한다는 내용을 보여주는 인포그래픽</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#f7f3e8" />
+      <stop offset="100%" stop-color="#ddebd3" />
+    </linearGradient>
+    <filter id="shadow">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#000000" flood-opacity="0.16" />
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2d6a4f" />
+    </marker>
+  </defs>
+
+  <rect width="1280" height="720" fill="url(#bg)" />
+
+  <text x="80" y="92" font-family="Arial, sans-serif" font-size="40" font-weight="700" fill="#1b4332">오브젝트 운영은 준비 순서가 핵심이다</text>
+  <text x="80" y="132" font-family="Arial, sans-serif" font-size="22" fill="#344e41">용, 전령, 바론은 나타난 뒤에 모이는 것이 아니라 그 전에 라인과 시야를 정리하며 선점해야 한다.</text>
+
+  <g filter="url(#shadow)">
+    <rect x="70" y="210" width="265" height="270" rx="26" fill="#ffffff" />
+    <rect x="360" y="210" width="265" height="270" rx="26" fill="#ffffff" />
+    <rect x="650" y="210" width="265" height="270" rx="26" fill="#ffffff" />
+    <rect x="940" y="210" width="265" height="270" rx="26" fill="#ffffff" />
+  </g>
+
+  <g font-family="Arial, sans-serif">
+    <circle cx="122" cy="262" r="28" fill="#40916c" />
+    <text x="113" y="271" font-size="24" font-weight="700" fill="#ffffff">1</text>
+    <text x="100" y="322" font-size="30" font-weight="700" fill="#081c15">라인 정리</text>
+    <text x="100" y="366" font-size="21" fill="#2d6a4f">오브젝트 근처 웨이브를</text>
+    <text x="100" y="396" font-size="21" fill="#2d6a4f">먼저 밀어 둔다.</text>
+    <text x="100" y="440" font-size="19" fill="#52796f">합류가 빨라지고</text>
+    <text x="100" y="468" font-size="19" fill="#52796f">손해 보는 CS가 줄어든다.</text>
+
+    <circle cx="412" cy="262" r="28" fill="#40916c" />
+    <text x="403" y="271" font-size="24" font-weight="700" fill="#ffffff">2</text>
+    <text x="390" y="322" font-size="30" font-weight="700" fill="#081c15">시야 확보</text>
+    <text x="390" y="366" font-size="21" fill="#2d6a4f">강가와 입구를 먼저 밝히고</text>
+    <text x="390" y="396" font-size="21" fill="#2d6a4f">적이 오는 길을 본다.</text>
+    <text x="390" y="440" font-size="19" fill="#52796f">깊이보다</text>
+    <text x="390" y="468" font-size="19" fill="#52796f">타이밍이 더 중요하다.</text>
+
+    <circle cx="702" cy="262" r="28" fill="#40916c" />
+    <text x="693" y="271" font-size="24" font-weight="700" fill="#ffffff">3</text>
+    <text x="680" y="322" font-size="30" font-weight="700" fill="#081c15">먼저 자리 잡기</text>
+    <text x="680" y="366" font-size="21" fill="#2d6a4f">강을 늦게 들어가지 말고</text>
+    <text x="680" y="396" font-size="21" fill="#2d6a4f">좋은 지형을 미리 선점한다.</text>
+    <text x="680" y="440" font-size="19" fill="#52796f">체력과 스펠도</text>
+    <text x="680" y="468" font-size="19" fill="#52796f">이때 같이 점검한다.</text>
+
+    <circle cx="992" cy="262" r="28" fill="#e76f51" />
+    <text x="983" y="271" font-size="24" font-weight="700" fill="#ffffff">4</text>
+    <text x="970" y="322" font-size="30" font-weight="700" fill="#081c15">교전</text>
+    <text x="970" y="366" font-size="21" fill="#2d6a4f">준비가 끝난 뒤에</text>
+    <text x="970" y="396" font-size="21" fill="#2d6a4f">오브젝트를 치거나 싸운다.</text>
+    <text x="970" y="440" font-size="19" fill="#52796f">불리하면 버리고</text>
+    <text x="970" y="468" font-size="19" fill="#52796f">반대편 이득을 본다.</text>
+  </g>
+
+  <path d="M336 260 L358 260" stroke="#2d6a4f" stroke-width="6" stroke-linecap="round" marker-end="url(#arrow)" />
+  <path d="M626 260 L648 260" stroke="#2d6a4f" stroke-width="6" stroke-linecap="round" marker-end="url(#arrow)" />
+  <path d="M916 260 L938 260" stroke="#2d6a4f" stroke-width="6" stroke-linecap="round" marker-end="url(#arrow)" />
+
+  <g filter="url(#shadow)">
+    <rect x="82" y="540" width="1116" height="110" rx="24" fill="#1b4332" />
+  </g>
+  <text x="118" y="590" font-family="Arial, sans-serif" font-size="28" font-weight="700" fill="#ffffff">핵심 문장</text>
+  <text x="118" y="628" font-family="Arial, sans-serif" font-size="24" fill="#d8f3dc">라인을 먼저 밀지 못하면 시야가 늦고, 시야가 늦으면 오브젝트 지역도 늦게 들어가게 된다.</text>
+</svg>
