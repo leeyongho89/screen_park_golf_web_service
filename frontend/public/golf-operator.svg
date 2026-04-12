@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 180" role="img" aria-labelledby="title desc">
+  <title id="title">스크린골프 운영 이미지</title>
+  <desc id="desc">실내 골프 타석과 운영 데스크를 단순화한 그림</desc>
+  <rect width="320" height="180" fill="#e8f1ed"/>
+  <rect x="18" y="22" width="176" height="104" rx="8" fill="#1f8a70"/>
+  <path d="M40 104c22-31 45-38 69-20 23 17 41 11 65-28v48z" fill="#f7d154"/>
+  <path d="M52 98c28-26 49-27 71-4 16 17 30 13 52-18" fill="none" stroke="#ffffff" stroke-width="8" stroke-linecap="round"/>
+  <rect x="210" y="80" width="84" height="58" rx="8" fill="#ffffff"/>
+  <rect x="225" y="96" width="54" height="9" rx="4" fill="#1f8a70"/>
+  <rect x="225" y="114" width="38" height="9" rx="4" fill="#b42318"/>
+  <circle cx="246" cy="56" r="20" fill="#f2b84b"/>
+  <path d="M246 78v46" stroke="#2f3a38" stroke-width="8" stroke-linecap="round"/>
+  <path d="M246 88l-34 22" stroke="#2f3a38" stroke-width="8" stroke-linecap="round"/>
+  <path d="M246 92l34-12" stroke="#2f3a38" stroke-width="8" stroke-linecap="round"/>
+  <path d="M230 138c12-7 24-7 36 0" fill="none" stroke="#2f3a38" stroke-width="8" stroke-linecap="round"/>
+</svg>

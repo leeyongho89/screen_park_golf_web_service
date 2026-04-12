@@ -1,0 +1,27 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data
+uploads/*
+!uploads/.gitkeep
+backups/*
+!backups/.gitkeep
+
+# Raw operational data may contain personal information.
+db/raw/*
+!db/raw/.gitkeep
+
+# Python
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+
+# Node
+node_modules/
+dist/
+build/
+coverage/
+

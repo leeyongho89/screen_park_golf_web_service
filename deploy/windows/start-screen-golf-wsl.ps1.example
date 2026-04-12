@@ -1,0 +1,4 @@
+$DistroName = "Ubuntu"
+$ServiceName = "screen-golf.service"
+
+wsl.exe -d $DistroName --user root -- systemctl start $ServiceName
