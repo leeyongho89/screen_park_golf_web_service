@@ -1,13 +1,14 @@
-import { ChangeEvent, FormEvent, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, Fragment, FormEvent, useEffect, useMemo, useState } from "react";
 
 const API_BASE = import.meta.env.VITE_API_URL || "/api";
 
-type TabKey = "dashboard" | "memberInfo" | "sales" | "salesSummary" | "memberships" | "products" | "sms";
+type TabKey = "dashboard" | "memberInfo" | "reservations" | "sales" | "salesSummary" | "memberships" | "products" | "sms";
 type MembershipStatusFilter = "사용중" | "정지" | "만료" | "환불";
 type SalesSummaryRange = "하루" | "1주" | "2주" | "3주" | "4주" | "한달";
-type SalesSummaryModalKey = "payment" | "product" | "member" | "day" | "totalAmount" | "totalCount" | "refundCount";
+type SalesSummaryModalKey = "payment" | "product" | "member" | "day" | "totalAmount" | "totalCount";
 type DashboardMembershipModalKey = "expiring" | "lowCount";
 type SmsContentType = "COMM" | "AD";
+type SmsSendStep = "target" | "content" | "review" | "done";
 
 interface ListResult<T> {
   items: T[];
@@ -87,11 +88,32 @@ interface Sale {
   sale_date: string;
   related_membership_id?: number | null;
   status: string;
+  original_sale_id?: number | null;
   note?: string | null;
   created_at: string;
 }
 
+interface Reservation {
+  id: number;
+  bay_number: number;
+  member_id?: number | null;
+  member_name?: string | null;
+  member_phone?: string | null;
+  customer_name: string;
+  customer_phone: string;
+  reservation_date: string;
+  start_time: string;
+  end_time: string;
+  status: "예약" | "취소";
+  note?: string | null;
+  operator_name?: string | null;
+  canceled_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 interface DashboardSummary {
+  current_member_count: number;
   today_new_members: number;
   today_sales: string;
   month_sales: string;
@@ -117,7 +139,6 @@ interface SalesSummary {
   to_date: string;
   total_amount: string;
   total_count: number;
-  refund_count: number;
   by_payment_method: Record<string, string>;
   by_sale_type: Record<string, string>;
   by_member: SalesBreakdownItem[];
@@ -235,6 +256,17 @@ interface SaleForm {
   note: string;
 }
 
+interface ReservationForm {
+  bay_number: string;
+  member_id: string;
+  customer_name: string;
+  customer_phone: string;
+  reservation_date: string;
+  start_time: string;
+  end_time: string;
+  note: string;
+}
+
 interface MembershipPeriodForm {
   start_date: string;
   end_date: string;
@@ -252,6 +284,8 @@ interface SmsComposeForm {
   expiring_days: string;
   include_low_remaining_memberships: boolean;
   low_remaining_count: string;
+  include_birthdays: boolean;
+  birthday_days: string;
   group_ids: string[];
   content_type: SmsContentType;
   template_id: string;
@@ -275,9 +309,31 @@ function pad2(value: number) {
   return String(value).padStart(2, "0");
 }
 
+function formatDateValue(value: Date) {
+  return `${value.getFullYear()}-${pad2(value.getMonth() + 1)}-${pad2(value.getDate())}`;
+}
+
+function parseDateValue(value: string) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return null;
+  const [, yearText, monthText, dayText] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() + 1 !== month || date.getUTCDate() !== day) {
+    return null;
+  }
+  return date;
+}
+
+function formatUtcDateValue(value: Date) {
+  return `${value.getUTCFullYear()}-${pad2(value.getUTCMonth() + 1)}-${pad2(value.getUTCDate())}`;
+}
+
 const today = () => {
   const date = new Date();
-  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+  return formatDateValue(date);
 };
 
 function formatCurrentDateTime(value: Date) {
@@ -290,7 +346,17 @@ const MEMBERSHIP_STATUS_FILTERS: MembershipStatusFilter[] = ["사용중", "정�
 const MEMBERSHIP_PAGE_SIZE = 500;
 const SALES_SUMMARY_RANGES: SalesSummaryRange[] = ["하루", "1주", "2주", "3주", "4주", "한달"];
 const CHART_COLORS = ["#1f8a70", "#d08418", "#2557a7", "#b42318", "#6f5cc2", "#008a9a", "#8a5a1f", "#56635f"];
-const SMS_FEATURE_VISIBLE = false;
+const SMS_FEATURE_VISIBLE = true;
+const SMS_SEND_STEPS: Array<{ key: SmsSendStep; label: string }> = [
+  { key: "target", label: "받는 사람" },
+  { key: "content", label: "내용 입력" },
+  { key: "review", label: "확인" },
+  { key: "done", label: "결과" }
+];
+const RESERVATION_BAYS = [1, 2, 3, 4, 5, 6];
+const RESERVATION_OPEN_TIME = "09:00";
+const RESERVATION_CLOSE_TIME = "23:00";
+const RESERVATION_SLOT_MINUTES = 30;
 
 const emptyMemberForm: MemberForm = {
   name: "",
@@ -316,6 +382,17 @@ const emptySaleForm: SaleForm = {
   note: ""
 };
 
+const emptyReservationForm: ReservationForm = {
+  bay_number: "1",
+  member_id: "",
+  customer_name: "",
+  customer_phone: "",
+  reservation_date: today(),
+  start_time: RESERVATION_OPEN_TIME,
+  end_time: "09:30",
+  note: ""
+};
+
 const emptyMembershipPeriodForm: MembershipPeriodForm = {
   start_date: "",
   end_date: "",
@@ -333,6 +410,8 @@ const emptySmsComposeForm: SmsComposeForm = {
   expiring_days: "7",
   include_low_remaining_memberships: false,
   low_remaining_count: "3",
+  include_birthdays: false,
+  birthday_days: "0",
   group_ids: [],
   content_type: "COMM",
   template_id: "",
@@ -380,10 +459,23 @@ function money(value: string | number | null | undefined) {
   return `${numberValue.toLocaleString("ko-KR")}원`;
 }
 
+function isRefundSale(sale: Sale) {
+  return sale.status.includes("환불") || Number(sale.amount || 0) < 0 || Boolean(sale.original_sale_id);
+}
+
 function displayPhone(value: string | null | undefined) {
   if (!value) return "-";
   if (value.length === 11) return `${value.slice(0, 3)}-${value.slice(3, 7)}-${value.slice(7)}`;
   return value;
+}
+
+function smsMemberOptionLabel(member: Member) {
+  return [
+    member.name,
+    displayPhone(member.phone),
+    member.gender || "성별 없음",
+    member.birth_date || "생년월일 없음"
+  ].join(" / ");
 }
 
 function digitsOnly(value: string | null | undefined) {
@@ -417,17 +509,64 @@ function formatTime(value: string | null | undefined) {
 
 function addDays(startDate: string, durationDays?: number | null) {
   if (!startDate || !durationDays) return "";
-  const date = new Date(`${startDate}T00:00:00`);
-  if (Number.isNaN(date.getTime())) return "";
-  date.setDate(date.getDate() + durationDays - 1);
-  return date.toISOString().slice(0, 10);
+  const date = parseDateValue(startDate);
+  if (!date) return "";
+  date.setUTCDate(date.getUTCDate() + durationDays - 1);
+  return formatUtcDateValue(date);
 }
 
 function shiftDate(value: string, days: number) {
-  const date = new Date(`${value}T00:00:00`);
-  if (Number.isNaN(date.getTime())) return value;
-  date.setDate(date.getDate() + days);
-  return date.toISOString().slice(0, 10);
+  const date = parseDateValue(value);
+  if (!date) return value;
+  date.setUTCDate(date.getUTCDate() + days);
+  return formatUtcDateValue(date);
+}
+
+function formatDateWithWeekday(value: string) {
+  const date = parseDateValue(value);
+  if (!date) return value || "-";
+  const weekdays = ["일요일", "월요일", "화요일", "수요일", "목요일", "금요일", "토요일"];
+  return `${value}-${weekdays[date.getUTCDay()]}`;
+}
+
+function normalizeTimeValue(value: string | null | undefined) {
+  return (value || "").slice(0, 5);
+}
+
+function timeToMinutes(value: string) {
+  const [hour, minute] = normalizeTimeValue(value).split(":").map(Number);
+  return (hour || 0) * 60 + (minute || 0);
+}
+
+function minutesToTime(totalMinutes: number) {
+  const hour = Math.floor(totalMinutes / 60);
+  const minute = totalMinutes % 60;
+  return `${pad2(hour)}:${pad2(minute)}`;
+}
+
+function addMinutesToTime(value: string, minutes: number) {
+  return minutesToTime(timeToMinutes(value) + minutes);
+}
+
+function buildReservationTimeSlots() {
+  const slots: string[] = [];
+  for (
+    let minutes = timeToMinutes(RESERVATION_OPEN_TIME);
+    minutes < timeToMinutes(RESERVATION_CLOSE_TIME);
+    minutes += RESERVATION_SLOT_MINUTES
+  ) {
+    slots.push(minutesToTime(minutes));
+  }
+  return slots;
+}
+
+function reservationCoversSlot(reservation: Reservation, slot: string) {
+  const slotMinutes = timeToMinutes(slot);
+  return timeToMinutes(reservation.start_time) <= slotMinutes && slotMinutes < timeToMinutes(reservation.end_time);
+}
+
+function reservationStartsAt(reservation: Reservation, slot: string) {
+  return normalizeTimeValue(reservation.start_time) === normalizeTimeValue(slot);
 }
 
 function salesSummaryDays(range: SalesSummaryRange) {
@@ -526,8 +665,18 @@ function App() {
   const [membershipKeyword, setMembershipKeyword] = useState("");
   const [membershipPage, setMembershipPage] = useState(1);
   const [membershipTotal, setMembershipTotal] = useState(0);
+  const [reservations, setReservations] = useState<Reservation[]>([]);
+  const [reservationDate, setReservationDate] = useState(today());
+  const [reservationForm, setReservationForm] = useState<ReservationForm>(emptyReservationForm);
+  const [reservationModalOpen, setReservationModalOpen] = useState(false);
+  const [reservationCanceledModalOpen, setReservationCanceledModalOpen] = useState(false);
+  const [editingReservation, setEditingReservation] = useState<Reservation | null>(null);
+  const [reservationMemberMatches, setReservationMemberMatches] = useState<Member[]>([]);
+  const [reservationMemberInputFocused, setReservationMemberInputFocused] = useState(false);
+  const [reservationSelectedMember, setReservationSelectedMember] = useState<Member | null>(null);
   const [sales, setSales] = useState<Sale[]>([]);
   const [salesKeyword, setSalesKeyword] = useState("");
+  const [hideRefundSales, setHideRefundSales] = useState(true);
   const [salesSummary, setSalesSummary] = useState<SalesSummary | null>(null);
   const [salesSummaryRange, setSalesSummaryRange] = useState<SalesSummaryRange>("하루");
   const [salesSummaryTo, setSalesSummaryTo] = useState(today());
@@ -576,16 +725,23 @@ function App() {
   const [smsHistory, setSmsHistory] = useState<SmsMessage[]>([]);
   const [smsMemberOptions, setSmsMemberOptions] = useState<Member[]>([]);
   const [smsComposeForm, setSmsComposeForm] = useState<SmsComposeForm>(emptySmsComposeForm);
+  const [smsSendStep, setSmsSendStep] = useState<SmsSendStep>("target");
+  const [smsLastSentMessage, setSmsLastSentMessage] = useState<SmsMessage | null>(null);
   const [smsPreview, setSmsPreview] = useState<SmsPreviewResult | null>(null);
+  const [smsPreviewModalOpen, setSmsPreviewModalOpen] = useState(false);
   const [smsPreviewKeyword, setSmsPreviewKeyword] = useState("");
   const [smsExcludedRecipients, setSmsExcludedRecipients] = useState<string[]>([]);
   const [smsGroupModalOpen, setSmsGroupModalOpen] = useState(false);
   const [smsGroupForm, setSmsGroupForm] = useState<SmsGroupForm>(emptySmsGroupForm);
   const [smsEditingGroup, setSmsEditingGroup] = useState<SmsGroup | null>(null);
   const [smsGroupMemberKeyword, setSmsGroupMemberKeyword] = useState("");
+  const [smsGroupAvailableSelection, setSmsGroupAvailableSelection] = useState<string[]>([]);
+  const [smsGroupSelectedSelection, setSmsGroupSelectedSelection] = useState<string[]>([]);
   const [smsTemplateModalOpen, setSmsTemplateModalOpen] = useState(false);
   const [smsTemplateForm, setSmsTemplateForm] = useState<SmsTemplateForm>(emptySmsTemplateForm);
   const [smsEditingTemplate, setSmsEditingTemplate] = useState<SmsTemplate | null>(null);
+  const [smsHistoryModalOpen, setSmsHistoryModalOpen] = useState(false);
+  const [smsHistoryMessageTarget, setSmsHistoryMessageTarget] = useState<SmsMessage | null>(null);
   const [smsHistoryDetailTarget, setSmsHistoryDetailTarget] = useState<SmsMessage | null>(null);
   const [smsHistoryDetailItems, setSmsHistoryDetailItems] = useState<SmsMessageRecipient[]>([]);
   const [smsHistoryDetailKeyword, setSmsHistoryDetailKeyword] = useState("");
@@ -598,10 +754,11 @@ function App() {
     [activeSaleProducts, saleForm.product_id]
   );
   const filteredSales = useMemo(() => {
+    const baseItems = hideRefundSales ? sales.filter((sale) => !isRefundSale(sale)) : sales;
     const keyword = salesKeyword.trim().toLowerCase();
     const normalized = digitsOnly(salesKeyword);
-    if (!keyword && !normalized) return sales;
-    return sales.filter((sale) => {
+    if (!keyword && !normalized) return baseItems;
+    return baseItems.filter((sale) => {
       const fields = [
         sale.member_name_snapshot || "비회원",
         displayPhone(sale.member_phone_snapshot),
@@ -617,12 +774,9 @@ function App() {
       const phoneMatch = normalized ? (sale.member_phone_snapshot || "").includes(normalized) : false;
       return fields.includes(keyword) || phoneMatch;
     });
-  }, [sales, salesKeyword]);
+  }, [sales, salesKeyword, hideRefundSales]);
   const filteredSalesSummaryDetailItems = useMemo(() => {
-    const baseItems =
-      salesSummaryModal === "refundCount"
-        ? salesSummaryDetailItems.filter((sale) => Number(sale.amount) < 0)
-        : salesSummaryDetailItems;
+    const baseItems = hideRefundSales ? salesSummaryDetailItems.filter((sale) => !isRefundSale(sale)) : salesSummaryDetailItems;
     const keyword = salesSummaryDetailKeyword.trim().toLowerCase();
     const normalized = digitsOnly(salesSummaryDetailKeyword);
     if (!keyword && !normalized) return baseItems;
@@ -643,7 +797,7 @@ function App() {
       const phoneMatch = normalized ? (sale.member_phone_snapshot || "").includes(normalized) : false;
       return text.includes(keyword) || phoneMatch;
     });
-  }, [salesSummaryDetailItems, salesSummaryDetailKeyword, salesSummaryModal]);
+  }, [salesSummaryDetailItems, salesSummaryDetailKeyword, salesSummaryModal, hideRefundSales]);
   const dashboardNewMemberDaysValue = Math.max(1, Number(dashboardNewMemberDays || 1));
   const dashboardSalesDaysValue = Math.max(1, Number(dashboardSalesDays || 1));
   const showMembershipFields = selectedSaleProduct?.product_type === "기간제" || selectedSaleProduct?.product_type === "횟수";
@@ -677,16 +831,43 @@ function App() {
     saleForm.member_name.trim().length > 0 &&
     (!saleSelectedMember || saleForm.member_name !== saleSelectedMember.name) &&
     saleMemberMatches.length > 0;
+  const reservationTimeSlots = useMemo(() => buildReservationTimeSlots(), []);
+  const activeReservationItems = useMemo(() => reservations.filter((reservation) => reservation.status !== "취소"), [reservations]);
+  const canceledReservationItems = useMemo(() => reservations.filter((reservation) => reservation.status === "취소"), [reservations]);
+  const reservationStats = useMemo(
+    () => ({
+      reserved: reservations.filter((reservation) => reservation.status === "예약").length,
+      canceled: canceledReservationItems.length
+    }),
+    [reservations, canceledReservationItems]
+  );
+  const showReservationMemberMatches =
+    reservationMemberInputFocused &&
+    reservationForm.customer_name.trim().length > 0 &&
+    (!reservationSelectedMember || reservationForm.customer_name !== reservationSelectedMember.name) &&
+    reservationMemberMatches.length > 0;
   const filteredSmsGroupMemberOptions = useMemo(() => {
     const keyword = smsGroupMemberKeyword.trim().toLowerCase();
     const normalized = digitsOnly(smsGroupMemberKeyword);
     if (!keyword && !normalized) return smsMemberOptions;
     return smsMemberOptions.filter((member) => {
-      const text = [member.name, member.memo || "", displayPhone(member.phone)].join(" ").toLowerCase();
+      const text = [member.name, member.memo || "", displayPhone(member.phone), member.gender || "", member.birth_date || ""]
+        .join(" ")
+        .toLowerCase();
       const phoneMatch = normalized ? member.phone.includes(normalized) : false;
       return text.includes(keyword) || phoneMatch;
     });
   }, [smsGroupMemberKeyword, smsMemberOptions]);
+  const smsGroupAvailableMembers = useMemo(() => {
+    const selectedIds = new Set(smsGroupForm.member_ids);
+    return filteredSmsGroupMemberOptions.filter((member) => !selectedIds.has(String(member.id)));
+  }, [filteredSmsGroupMemberOptions, smsGroupForm.member_ids]);
+  const smsGroupSelectedMembers = useMemo(() => {
+    const membersById = new Map(smsMemberOptions.map((member) => [String(member.id), member]));
+    return smsGroupForm.member_ids
+      .map((memberId) => membersById.get(memberId))
+      .filter((member): member is Member => Boolean(member));
+  }, [smsGroupForm.member_ids, smsMemberOptions]);
   const filteredSmsPreviewEligible = useMemo(() => {
     const items = smsPreview?.eligible_recipients || [];
     const keyword = smsPreviewKeyword.trim().toLowerCase();
@@ -867,6 +1048,13 @@ function App() {
     setSales(result.items);
   }
 
+  async function refreshReservations(targetDate = reservationDate) {
+    const params = new URLSearchParams({ target_date: targetDate });
+    const result = await api<ListResult<Reservation>>(`/reservations?${params.toString()}`);
+    setReservations(result.items);
+    return result.items;
+  }
+
   async function refreshSalesSummary(fromDate = salesSummaryFrom, toDate = salesSummaryTo) {
     if (!fromDate || !toDate) return;
     const params = new URLSearchParams({
@@ -884,6 +1072,12 @@ function App() {
   async function refreshSmsTemplates() {
     const result = await api<ListResult<SmsTemplate>>("/sms/templates");
     setSmsTemplates(result.items);
+    setSmsComposeForm((current) => {
+      if (!current.template_id) return current;
+      const selectedTemplate = result.items.find((template) => String(template.id) === current.template_id);
+      if (selectedTemplate?.is_active) return current;
+      return { ...current, template_id: "", title: "", content: "" };
+    });
   }
 
   async function refreshSmsHistory() {
@@ -900,10 +1094,29 @@ function App() {
     await Promise.all([refreshSmsGroups(), refreshSmsTemplates(), refreshSmsHistory(), refreshSmsMemberOptions()]);
   }
 
+  async function refreshSmsDataAndClearTarget() {
+    setSmsComposeForm((current) => ({
+      ...current,
+      include_all_members: false,
+      include_expiring_memberships: false,
+      include_low_remaining_memberships: false,
+      include_birthdays: false,
+      group_ids: []
+    }));
+    setSmsPreview(null);
+    setSmsPreviewModalOpen(false);
+    setSmsPreviewKeyword("");
+    setSmsExcludedRecipients([]);
+    setSmsLastSentMessage(null);
+    await refreshSmsData();
+  }
+
   function openSmsGroupCreateModal() {
     setSmsEditingGroup(null);
     setSmsGroupForm(emptySmsGroupForm);
     setSmsGroupMemberKeyword("");
+    setSmsGroupAvailableSelection([]);
+    setSmsGroupSelectedSelection([]);
     setSmsGroupModalOpen(true);
   }
 
@@ -915,7 +1128,39 @@ function App() {
       member_ids: group.member_ids.map(String)
     });
     setSmsGroupMemberKeyword("");
+    setSmsGroupAvailableSelection([]);
+    setSmsGroupSelectedSelection([]);
     setSmsGroupModalOpen(true);
+  }
+
+  function closeSmsGroupModal() {
+    setSmsGroupModalOpen(false);
+    setSmsGroupAvailableSelection([]);
+    setSmsGroupSelectedSelection([]);
+  }
+
+  function addSmsGroupMembers() {
+    if (smsGroupAvailableSelection.length === 0) return;
+    setSmsGroupForm((current) => {
+      const nextMemberIds = [...current.member_ids];
+      smsGroupAvailableSelection.forEach((memberId) => {
+        if (!nextMemberIds.includes(memberId)) {
+          nextMemberIds.push(memberId);
+        }
+      });
+      return { ...current, member_ids: nextMemberIds };
+    });
+    setSmsGroupAvailableSelection([]);
+  }
+
+  function removeSmsGroupMembers() {
+    if (smsGroupSelectedSelection.length === 0) return;
+    const removeIds = new Set(smsGroupSelectedSelection);
+    setSmsGroupForm((current) => ({
+      ...current,
+      member_ids: current.member_ids.filter((memberId) => !removeIds.has(memberId))
+    }));
+    setSmsGroupSelectedSelection([]);
   }
 
   function openSmsTemplateCreateModal() {
@@ -938,6 +1183,27 @@ function App() {
     return item.member_id ? `member:${item.member_id}` : `phone:${item.phone}`;
   }
 
+  function renderAiAssistButton() {
+    return (
+      <a
+        className="ai-assist-button"
+        href="https://chatgpt.com/"
+        target="_blank"
+        rel="noopener noreferrer"
+        aria-label="ChatGPT에서 AI에게 물어보기 새 창 열기"
+      >
+        <svg className="openai-logo-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" strokeWidth="1.6" />
+          <path
+            d="M12 6.4 16.9 9.2v5.6L12 17.6 7.1 14.8V9.2L12 6.4Zm0 3.4 2 1.1v2.2l-2 1.1-2-1.1v-2.2l2-1.1Z"
+            fill="currentColor"
+          />
+        </svg>
+        AI에게 물어보기
+      </a>
+    );
+  }
+
   function buildSmsTargetPayload(form: SmsComposeForm) {
     return {
       include_all_members: form.include_all_members,
@@ -945,11 +1211,55 @@ function App() {
       expiring_days: Math.max(1, Number(form.expiring_days || 7)),
       include_low_remaining_memberships: form.include_low_remaining_memberships,
       low_remaining_count: Math.max(0, Number(form.low_remaining_count || 3)),
+      include_birthdays: form.include_birthdays,
+      birthday_days: Math.max(0, Number(form.birthday_days || 0)),
       group_ids: form.group_ids.map(Number)
     };
   }
 
-  async function handleSmsPreview() {
+  function hasSmsTargetSelection(form: SmsComposeForm) {
+    return (
+      form.include_all_members ||
+      form.include_expiring_memberships ||
+      form.include_low_remaining_memberships ||
+      form.include_birthdays ||
+      form.group_ids.length > 0
+    );
+  }
+
+  function moveToSmsContentStep() {
+    if (!hasSmsTargetSelection(smsComposeForm)) {
+      setNotice("발송 대상을 하나 이상 선택해 주세요.");
+      setSmsSendStep("target");
+      return;
+    }
+    setSmsSendStep("content");
+  }
+
+  function moveToSmsReviewStep() {
+    if (smsPreview) {
+      setSmsSendStep("review");
+      return;
+    }
+    void handleSmsPreview();
+  }
+
+  function resetSmsSendFlow() {
+    setSmsComposeForm(emptySmsComposeForm);
+    setSmsPreview(null);
+    setSmsPreviewModalOpen(false);
+    setSmsPreviewKeyword("");
+    setSmsExcludedRecipients([]);
+    setSmsLastSentMessage(null);
+    setSmsSendStep("target");
+  }
+
+  async function handleSmsTargetPreview() {
+    if (!hasSmsTargetSelection(smsComposeForm)) {
+      setNotice("발송 대상을 하나 이상 선택해 주세요.");
+      setSmsSendStep("target");
+      return;
+    }
     setLoading(true);
     try {
       const result = await api<SmsPreviewResult>("/sms/recipients/preview", {
@@ -962,6 +1272,40 @@ function App() {
       setSmsPreview(result);
       setSmsPreviewKeyword("");
       setSmsExcludedRecipients([]);
+      setSmsPreviewModalOpen(true);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "포함 회원을 불러오지 못했습니다.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleSmsPreview() {
+    if (!hasSmsTargetSelection(smsComposeForm)) {
+      setNotice("발송 대상을 하나 이상 선택해 주세요.");
+      setSmsSendStep("target");
+      return;
+    }
+    if (!smsComposeForm.content.trim()) {
+      setNotice("문자 내용을 입력해 주세요.");
+      setSmsSendStep("content");
+      return;
+    }
+    setLoading(true);
+    try {
+      const result = await api<SmsPreviewResult>("/sms/recipients/preview", {
+        method: "POST",
+        body: JSON.stringify({
+          ...buildSmsTargetPayload(smsComposeForm),
+          content_type: smsComposeForm.content_type
+        })
+      });
+      setSmsPreview(result);
+      setSmsPreviewKeyword("");
+      setSmsExcludedRecipients([]);
+      setSmsPreviewModalOpen(false);
+      setSmsLastSentMessage(null);
+      setSmsSendStep("review");
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "발송 대상을 불러오지 못했습니다.");
     } finally {
@@ -975,6 +1319,26 @@ function App() {
   }
 
   async function handleSmsSend() {
+    if (!hasSmsTargetSelection(smsComposeForm)) {
+      setNotice("발송 대상을 하나 이상 선택해 주세요.");
+      setSmsSendStep("target");
+      return;
+    }
+    if (!smsComposeForm.content.trim()) {
+      setNotice("문자 내용을 입력해 주세요.");
+      setSmsSendStep("content");
+      return;
+    }
+    if (smsPreview) {
+      const activeEligibleCount =
+        smsPreview.eligible_recipients.length -
+        smsPreview.eligible_recipients.filter((item) => smsExcludedRecipients.includes(smsRecipientKey(item))).length;
+      if (activeEligibleCount <= 0) {
+        setNotice("최종 발송 대상이 없습니다.");
+        setSmsSendStep("review");
+        return;
+      }
+    }
     if (!window.confirm("현재 대상 기준으로 문자를 발송할까요?")) return;
     setLoading(true);
     try {
@@ -1005,10 +1369,12 @@ function App() {
         })
       });
       setNotice(message.status === "실패" ? "문자 발송 요청이 실패 이력으로 저장되었습니다." : "문자 발송 요청을 등록했습니다.");
+      setSmsLastSentMessage(message);
       setSmsPreview(null);
+      setSmsPreviewModalOpen(false);
       setSmsPreviewKeyword("");
       setSmsExcludedRecipients([]);
-      setSmsComposeForm((current) => ({ ...current, title: "", content: "", template_id: "" }));
+      setSmsSendStep("done");
       await refreshSmsHistory();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "문자 발송에 실패했습니다.");
@@ -1036,6 +1402,8 @@ function App() {
       setSmsGroupModalOpen(false);
       setSmsEditingGroup(null);
       setSmsGroupForm(emptySmsGroupForm);
+      setSmsGroupAvailableSelection([]);
+      setSmsGroupSelectedSelection([]);
       await refreshSmsGroups();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "문자 그룹 저장에 실패했습니다.");
@@ -1062,9 +1430,10 @@ function App() {
     event.preventDefault();
     setLoading(true);
     try {
-      const path = smsEditingTemplate ? `/sms/templates/${smsEditingTemplate.id}` : "/sms/templates";
-      const method = smsEditingTemplate ? "PUT" : "POST";
-      await api<SmsTemplate>(path, {
+      const editingTemplate = smsEditingTemplate;
+      const path = editingTemplate ? `/sms/templates/${editingTemplate.id}` : "/sms/templates";
+      const method = editingTemplate ? "PUT" : "POST";
+      const savedTemplate = await api<SmsTemplate>(path, {
         method,
         body: JSON.stringify({
           title: smsTemplateForm.title,
@@ -1072,13 +1441,37 @@ function App() {
           is_active: smsTemplateForm.is_active
         })
       });
-      setNotice(smsEditingTemplate ? "문자 템플릿을 수정했습니다." : "문자 템플릿을 저장했습니다.");
-      setSmsTemplateModalOpen(false);
-      setSmsEditingTemplate(null);
-      setSmsTemplateForm(emptySmsTemplateForm);
+      setNotice(editingTemplate ? "문자 템플릿을 수정했습니다." : "문자 템플릿을 저장했습니다.");
+      setSmsEditingTemplate(savedTemplate);
+      setSmsTemplateForm({
+        title: savedTemplate.title,
+        content: savedTemplate.content,
+        is_active: savedTemplate.is_active
+      });
       await refreshSmsTemplates();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "문자 템플릿 저장에 실패했습니다.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleSmsTemplateDelete(template: SmsTemplate) {
+    if (!window.confirm(`${template.title} 템플릿을 삭제할까요?`)) return;
+    setLoading(true);
+    try {
+      await api<void>(`/sms/templates/${template.id}`, { method: "DELETE" });
+      setNotice("문자 템플릿을 삭제했습니다.");
+      if (smsEditingTemplate?.id === template.id) {
+        setSmsEditingTemplate(null);
+        setSmsTemplateForm(emptySmsTemplateForm);
+      }
+      setSmsComposeForm((current) =>
+        current.template_id === String(template.id) ? { ...current, template_id: "", title: "", content: "" } : current
+      );
+      await refreshSmsTemplates();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "문자 템플릿 삭제에 실패했습니다.");
     } finally {
       setLoading(false);
     }
@@ -1089,8 +1482,8 @@ function App() {
     setSmsComposeForm((current) => ({
       ...current,
       template_id: templateId,
-      title: template ? template.title : current.title,
-      content: template ? template.content : current.content
+      title: template ? template.title : "",
+      content: template ? template.content : ""
     }));
   }
 
@@ -1117,7 +1510,7 @@ function App() {
   }
 
   async function openSalesSummaryModal(type: SalesSummaryModalKey) {
-    if (type === "totalAmount" || type === "totalCount" || type === "refundCount") {
+    if (type === "totalAmount" || type === "totalCount") {
       setLoading(true);
       try {
         const params = new URLSearchParams({
@@ -1152,6 +1545,7 @@ function App() {
         refreshProducts(),
         refreshMemberships(),
         refreshMembershipResults(),
+        refreshReservations(),
         refreshSales(),
         refreshSalesSummary(),
       ]);
@@ -1331,6 +1725,147 @@ function App() {
     setSaleEntryOpen(false);
     setSaleMemberMatches([]);
     setSaleMemberInputFocused(false);
+  }
+
+  function resetReservationForm(targetDate = reservationDate) {
+    setReservationForm({
+      ...emptyReservationForm,
+      reservation_date: targetDate
+    });
+    setReservationMemberMatches([]);
+    setReservationMemberInputFocused(false);
+    setReservationSelectedMember(null);
+  }
+
+  function openReservationCreateModal(bayNumber = 1, startTime = RESERVATION_OPEN_TIME) {
+    const endTime = addMinutesToTime(startTime, RESERVATION_SLOT_MINUTES);
+    setEditingReservation(null);
+    setReservationForm({
+      ...emptyReservationForm,
+      bay_number: String(bayNumber),
+      reservation_date: reservationDate,
+      start_time: startTime,
+      end_time: endTime
+    });
+    setReservationMemberMatches([]);
+    setReservationMemberInputFocused(false);
+    setReservationSelectedMember(null);
+    setReservationModalOpen(true);
+  }
+
+  function openReservationEditModal(reservation: Reservation) {
+    setEditingReservation(reservation);
+    setReservationForm({
+      bay_number: String(reservation.bay_number),
+      member_id: reservation.member_id ? String(reservation.member_id) : "",
+      customer_name: reservation.customer_name,
+      customer_phone: displayPhone(reservation.customer_phone),
+      reservation_date: reservation.reservation_date,
+      start_time: normalizeTimeValue(reservation.start_time),
+      end_time: normalizeTimeValue(reservation.end_time),
+      note: reservation.note || ""
+    });
+    setReservationMemberMatches([]);
+    setReservationMemberInputFocused(false);
+    setReservationSelectedMember(null);
+    setReservationModalOpen(true);
+  }
+
+  function closeReservationModal() {
+    setReservationModalOpen(false);
+    setEditingReservation(null);
+    resetReservationForm();
+  }
+
+  function reservationPayload() {
+    return {
+      bay_number: Number(reservationForm.bay_number),
+      member_id: reservationForm.member_id ? Number(reservationForm.member_id) : null,
+      customer_name: reservationForm.customer_name,
+      customer_phone: digitsOnly(reservationForm.customer_phone),
+      reservation_date: reservationForm.reservation_date,
+      start_time: reservationForm.start_time,
+      end_time: reservationForm.end_time,
+      note: reservationForm.note || null
+    };
+  }
+
+  async function handleReservationSubmit(event: FormEvent) {
+    event.preventDefault();
+    setLoading(true);
+    try {
+      const path = editingReservation ? `/reservations/${editingReservation.id}` : "/reservations";
+      const method = editingReservation ? "PUT" : "POST";
+      await api<Reservation>(path, {
+        method,
+        body: JSON.stringify(reservationPayload())
+      });
+      setNotice(editingReservation ? "예약을 수정했습니다." : "예약을 등록했습니다.");
+      setReservationModalOpen(false);
+      setEditingReservation(null);
+      resetReservationForm();
+      await refreshReservations(reservationForm.reservation_date || reservationDate);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "예약 저장에 실패했습니다.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function cancelReservation(reservation: Reservation) {
+    if (!window.confirm(`${reservation.customer_name} 예약을 취소할까요?`)) return;
+    setLoading(true);
+    try {
+      await api<Reservation>(`/reservations/${reservation.id}/cancel`, {
+        method: "PATCH",
+        body: JSON.stringify({ note: "화면에서 예약 취소" })
+      });
+      setNotice("예약을 취소했습니다.");
+      setReservationModalOpen(false);
+      await refreshReservations(reservationDate);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "예약 상태 변경에 실패했습니다.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function selectReservationMember(member: Member) {
+    setReservationSelectedMember(member);
+    setReservationMemberMatches([]);
+    setReservationMemberInputFocused(false);
+    setReservationForm((current) => ({
+      ...current,
+      member_id: String(member.id),
+      customer_name: member.name,
+      customer_phone: displayPhone(member.phone)
+    }));
+  }
+
+  function handleReservationNameChange(value: string) {
+    const shouldClearSelection = reservationSelectedMember && value !== reservationSelectedMember.name;
+    if (shouldClearSelection) {
+      setReservationSelectedMember(null);
+    }
+    setReservationForm((current) => ({
+      ...current,
+      member_id: shouldClearSelection ? "" : current.member_id,
+      customer_name: value,
+      customer_phone:
+        shouldClearSelection && digitsOnly(current.customer_phone) === reservationSelectedMember?.phone ? "" : current.customer_phone
+    }));
+  }
+
+  function handleReservationPhoneChange(value: string) {
+    const shouldClearSelection = reservationSelectedMember && digitsOnly(value) !== reservationSelectedMember.phone;
+    if (shouldClearSelection) {
+      setReservationSelectedMember(null);
+    }
+    setReservationForm((current) => ({
+      ...current,
+      member_id: shouldClearSelection ? "" : current.member_id,
+      customer_phone: value
+    }));
   }
 
   function handleSaleProductChange(productId: string) {
@@ -1701,6 +2236,14 @@ function App() {
   }, [activeTab]);
 
   useEffect(() => {
+    if (activeTab !== "reservations") return;
+    const timer = window.setTimeout(() => {
+      void refreshReservations(reservationDate);
+    }, 180);
+    return () => window.clearTimeout(timer);
+  }, [activeTab, reservationDate]);
+
+  useEffect(() => {
     if (activeTab !== "sms") return;
     const timer = window.setTimeout(() => {
       void refreshSmsData();
@@ -1710,14 +2253,19 @@ function App() {
 
   useEffect(() => {
     setSmsPreview(null);
+    setSmsPreviewModalOpen(false);
     setSmsPreviewKeyword("");
     setSmsExcludedRecipients([]);
+    setSmsLastSentMessage(null);
+    setSmsSendStep((current) => (current === "review" || current === "done" ? "target" : current));
   }, [
     smsComposeForm.include_all_members,
     smsComposeForm.include_expiring_memberships,
     smsComposeForm.expiring_days,
     smsComposeForm.include_low_remaining_memberships,
     smsComposeForm.low_remaining_count,
+    smsComposeForm.include_birthdays,
+    smsComposeForm.birthday_days,
     smsComposeForm.group_ids,
     smsComposeForm.content_type
   ]);
@@ -1751,6 +2299,36 @@ function App() {
       window.clearTimeout(timer);
     };
   }, [saleForm.member_name, saleSelectedMember]);
+
+  useEffect(() => {
+    const query = reservationForm.customer_name.trim();
+    if (!query || (reservationSelectedMember && query === reservationSelectedMember.name)) {
+      setReservationMemberMatches([]);
+      return;
+    }
+
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      try {
+        const params = new URLSearchParams({
+          keyword: query,
+          size: "8"
+        });
+        const result = await api<ListResult<Member>>(`/members?${params.toString()}`);
+        if (cancelled) return;
+        setReservationMemberMatches(result.items.filter((member) => member.name.includes(query)));
+      } catch {
+        if (!cancelled) {
+          setReservationMemberMatches([]);
+        }
+      }
+    }, 180);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [reservationForm.customer_name, reservationSelectedMember]);
 
   function selectSaleMember(member: Member) {
     setSaleSelectedMember(member);
@@ -1807,6 +2385,7 @@ function App() {
           {[
             ["dashboard", "홈"],
             ["memberInfo", "회원 정보"],
+            ["reservations", "예약"],
             ["sales", "매출관리"],
             ["salesSummary", "매출현황"],
             ["memberships", "보유 상품"],
@@ -1830,6 +2409,7 @@ function App() {
         {loading && <div className="loading">처리 중입니다.</div>}
         {activeTab === "dashboard" && renderDashboard()}
         {activeTab === "memberInfo" && renderMemberInfo()}
+        {activeTab === "reservations" && renderReservations()}
         {activeTab === "sales" && renderSales()}
         {activeTab === "salesSummary" && renderSalesSummary()}
         {activeTab === "memberships" && renderMemberships()}
@@ -1841,6 +2421,8 @@ function App() {
         {memberHistoryTarget && renderMemberSalesHistoryModal()}
         {productModalOpen && renderProductModal()}
         {saleEntryOpen && renderSaleEntryModal()}
+        {reservationModalOpen && renderReservationModal()}
+        {reservationCanceledModalOpen && renderCanceledReservationsModal()}
         {dashboardNewMembersOpen && renderDashboardNewMembersModal()}
         {dashboardSalesOpen && renderDashboardSalesModal()}
         {saleNoteModal && renderSaleNoteModal()}
@@ -1849,9 +2431,12 @@ function App() {
         {membershipHistoryTarget && renderMembershipHistoryModal()}
         {dashboardMembershipModal && renderDashboardMembershipModal()}
         {salesSummaryModal && renderSalesSummaryModal()}
+        {SMS_FEATURE_VISIBLE && smsPreviewModalOpen && renderSmsPreviewModal()}
         {SMS_FEATURE_VISIBLE && smsGroupModalOpen && renderSmsGroupModal()}
         {SMS_FEATURE_VISIBLE && smsTemplateModalOpen && renderSmsTemplateModal()}
+        {SMS_FEATURE_VISIBLE && smsHistoryModalOpen && renderSmsHistoryModal()}
         {SMS_FEATURE_VISIBLE && smsHistoryDetailTarget && renderSmsHistoryDetailModal()}
+        {SMS_FEATURE_VISIBLE && smsHistoryMessageTarget && renderSmsHistoryMessageModal()}
       </main>
     </div>
   );
@@ -1860,6 +2445,12 @@ function App() {
     return (
       <section className="page-section">
         <div className="metric-grid dashboard-metric-grid">
+          <article className="metric metric-button-card">
+            <span>현재 회원 수</span>
+            <button type="button" onClick={() => setActiveTab("memberInfo")}>
+              {dashboard?.current_member_count ?? 0}명
+            </button>
+          </article>
           <article className="metric metric-button-card">
             <span>신규 회원</span>
             <label className="metric-filter-control">
@@ -1966,6 +2557,10 @@ function App() {
           >
             삭제 회원정보 복구
           </button>
+          <div className="member-count-pill" aria-label="현재 활성 회원 수">
+            <span>현재 회원</span>
+            <strong>{dashboard?.current_member_count ?? 0}명</strong>
+          </div>
           <div className="search-row search-row-single">
             <input
               className="large-input"
@@ -2888,6 +3483,270 @@ function App() {
     );
   }
 
+  function renderReservations() {
+    const reservationForSlot = (bayNumber: number, slot: string) =>
+      activeReservationItems.find((reservation) => reservation.bay_number === bayNumber && reservationCoversSlot(reservation, slot));
+
+    return (
+      <section className="page-section reservations-page">
+        <div className="page-title-row reservation-title-row">
+          <button type="button" onClick={() => openReservationCreateModal(1, RESERVATION_OPEN_TIME)}>
+            예약 등록
+          </button>
+          <button type="button" className="secondary" onClick={() => setReservationCanceledModalOpen(true)}>
+            취소 이력 {reservationStats.canceled}건
+          </button>
+        </div>
+
+        <section className="table-section reservation-control-panel">
+          <div className="reservation-date-controls">
+            <span className="reservation-count-pill">예약 {reservationStats.reserved}건</span>
+            <input
+              aria-label="예약 날짜"
+              type="date"
+              value={reservationDate}
+              onChange={(event) => setReservationDate(event.target.value)}
+            />
+            <span className="reservation-date-display">{formatDateWithWeekday(reservationDate)}</span>
+          </div>
+        </section>
+
+        <section className="table-section reservation-schedule-section">
+          <div className="reservation-schedule-wrap">
+            <div className="reservation-schedule-grid" style={{ gridTemplateColumns: `86px repeat(${RESERVATION_BAYS.length}, minmax(150px, 1fr))` }}>
+              <div className="reservation-schedule-heading">시간</div>
+              {RESERVATION_BAYS.map((bayNumber) => (
+                <div key={bayNumber} className="reservation-schedule-heading">
+                  {bayNumber}번 타석
+                </div>
+              ))}
+              {reservationTimeSlots.map((slot) => (
+                <Fragment key={slot}>
+                  <div key={`${slot}-time`} className="reservation-time-cell">
+                    {slot}
+                  </div>
+                  {RESERVATION_BAYS.map((bayNumber) => {
+                    const reservation = reservationForSlot(bayNumber, slot);
+                    const isStart = reservation ? reservationStartsAt(reservation, slot) : false;
+                    return (
+                      <button
+                        key={`${slot}-${bayNumber}`}
+                        type="button"
+                        className={`reservation-slot ${reservation ? "occupied" : ""} ${
+                          reservation ? `status-${reservation.status}` : ""
+                        }`}
+                        onClick={() => (reservation ? openReservationEditModal(reservation) : openReservationCreateModal(bayNumber, slot))}
+                      >
+                        {reservation ? (
+                          isStart ? (
+                            <span className="reservation-card-mini">
+                              <strong>{reservation.customer_name}</strong>
+                              <small>
+                                {normalizeTimeValue(reservation.start_time)}-{normalizeTimeValue(reservation.end_time)} · {reservation.status}
+                              </small>
+                              {reservation.note?.trim() && <em>{reservation.note}</em>}
+                            </span>
+                          ) : (
+                            <span className="reservation-continuation">예약중</span>
+                          )
+                        ) : (
+                          <span className="reservation-empty">예약 가능</span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </Fragment>
+              ))}
+            </div>
+          </div>
+        </section>
+
+      </section>
+    );
+  }
+
+  function renderCanceledReservationsModal() {
+    return (
+      <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="canceled-reservations-title">
+        <section className="form-panel modal-panel canceled-reservation-panel">
+          <div className="modal-title-row">
+            <div>
+              <h2 id="canceled-reservations-title">취소 이력</h2>
+              <p className="note-meta">
+                {reservationDate} 취소된 예약 {canceledReservationItems.length}건
+              </p>
+            </div>
+            <button type="button" className="secondary" onClick={() => setReservationCanceledModalOpen(false)}>
+              닫기
+            </button>
+          </div>
+          {canceledReservationItems.length === 0 ? (
+            <p className="empty">취소된 예약이 없습니다.</p>
+          ) : (
+            <div className="compact-list">
+              {canceledReservationItems.map((reservation) => (
+                <button
+                  key={reservation.id}
+                  type="button"
+                  className="reservation-canceled-row"
+                  onClick={() => {
+                    setReservationCanceledModalOpen(false);
+                    openReservationEditModal(reservation);
+                  }}
+                >
+                  <strong>
+                    {reservation.bay_number}번 타석 · {normalizeTimeValue(reservation.start_time)}-{normalizeTimeValue(reservation.end_time)}
+                  </strong>
+                  <span>
+                    {reservation.customer_name} · {displayPhone(reservation.customer_phone)} · {reservation.note || "메모 없음"}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+        </section>
+      </div>
+    );
+  }
+
+  function renderReservationModal() {
+    const isCanceled = editingReservation?.status === "취소";
+    return (
+      <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="reservation-modal-title">
+        <form className="form-panel modal-panel reservation-modal-panel" onSubmit={handleReservationSubmit}>
+          <div className="modal-title-row">
+            <div>
+              <h2 id="reservation-modal-title">{editingReservation ? "예약 수정" : "예약 등록"}</h2>
+              {editingReservation && <p className="note-meta">현재 상태: {editingReservation.status}</p>}
+            </div>
+            <button type="button" className="secondary" onClick={closeReservationModal}>
+              닫기
+            </button>
+          </div>
+
+          <div className="form-grid">
+            <label>
+              예약일
+              <input
+                required
+                type="date"
+                value={reservationForm.reservation_date}
+                disabled={isCanceled}
+                onChange={(event) => setReservationForm({ ...reservationForm, reservation_date: event.target.value })}
+              />
+            </label>
+            <label>
+              타석
+              <select
+                value={reservationForm.bay_number}
+                disabled={isCanceled}
+                onChange={(event) => setReservationForm({ ...reservationForm, bay_number: event.target.value })}
+              >
+                {RESERVATION_BAYS.map((bayNumber) => (
+                  <option key={bayNumber} value={bayNumber}>
+                    {bayNumber}번 타석
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              시작 시간
+              <input
+                required
+                type="time"
+                step={RESERVATION_SLOT_MINUTES * 60}
+                min={RESERVATION_OPEN_TIME}
+                max={RESERVATION_CLOSE_TIME}
+                value={reservationForm.start_time}
+                disabled={isCanceled}
+                onChange={(event) =>
+                  setReservationForm({
+                    ...reservationForm,
+                    start_time: event.target.value,
+                    end_time: addMinutesToTime(event.target.value, RESERVATION_SLOT_MINUTES)
+                  })
+                }
+              />
+            </label>
+            <label>
+              종료 시간
+              <input
+                required
+                type="time"
+                step={RESERVATION_SLOT_MINUTES * 60}
+                min={RESERVATION_OPEN_TIME}
+                max={RESERVATION_CLOSE_TIME}
+                value={reservationForm.end_time}
+                disabled={isCanceled}
+                onChange={(event) => setReservationForm({ ...reservationForm, end_time: event.target.value })}
+              />
+            </label>
+          </div>
+
+          <label>
+            예약자명
+            <div className="member-autocomplete">
+              <input
+                required
+                placeholder="회원명을 입력하면 등록 회원이 바로 보입니다"
+                value={reservationForm.customer_name}
+                disabled={isCanceled}
+                onFocus={() => setReservationMemberInputFocused(true)}
+                onBlur={() => window.setTimeout(() => setReservationMemberInputFocused(false), 120)}
+                onChange={(event) => handleReservationNameChange(event.target.value)}
+              />
+              {showReservationMemberMatches && (
+                <div className="autocomplete-list" role="listbox" aria-label="예약 회원 검색 결과">
+                  {reservationMemberMatches.map((member) => (
+                    <button
+                      type="button"
+                      className="autocomplete-item"
+                      key={member.id}
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        selectReservationMember(member);
+                      }}
+                    >
+                      <strong>{member.name}</strong>
+                      <span>{displayPhone(member.phone)}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </label>
+          <label>
+            연락처
+            <input
+              required
+              inputMode="tel"
+              value={reservationForm.customer_phone}
+              disabled={isCanceled}
+              onChange={(event) => handleReservationPhoneChange(event.target.value)}
+            />
+          </label>
+          <label>
+            메모
+            <textarea
+              value={reservationForm.note}
+              disabled={isCanceled}
+              onChange={(event) => setReservationForm({ ...reservationForm, note: event.target.value })}
+            />
+          </label>
+
+          <div className="form-actions reservation-modal-actions">
+            {!isCanceled && <button type="submit">{editingReservation ? "예약 저장" : "예약 등록"}</button>}
+            {editingReservation && !isCanceled && (
+              <button type="button" className="danger" onClick={() => void cancelReservation(editingReservation)}>
+                예약 취소
+              </button>
+            )}
+          </div>
+        </form>
+      </div>
+    );
+  }
+
   function renderSales() {
     return (
       <section className="page-section">
@@ -2918,6 +3777,14 @@ function App() {
                 지우기
               </button>
             </div>
+            <label className="check-line filter-check-line">
+              <input
+                type="checkbox"
+                checked={hideRefundSales}
+                onChange={(event) => setHideRefundSales(event.target.checked)}
+              />
+              환불정보 미표기
+            </label>
             <p className="sales-search-meta">최신 {sales.length}건 중 {filteredSales.length}건 표시</p>
           </div>
           <RecentSalesGrid items={filteredSales} onRefund={refundSale} onShowNote={setSaleNoteModal} />
@@ -2969,13 +3836,6 @@ function App() {
               상세 보기
             </button>
           </article>
-          <article className="metric warning summary-metric-card">
-            <span>환불 건수</span>
-            <strong>{salesSummary?.refund_count ?? 0}건</strong>
-            <button type="button" className="secondary metric-detail-button" onClick={() => void openSalesSummaryModal("refundCount")}>
-              상세 보기
-            </button>
-          </article>
         </div>
 
         <div className="summary-action-grid">
@@ -3011,7 +3871,6 @@ function App() {
       day: "기간 매출액",
       totalAmount: "총 매출액 상세",
       totalCount: "매출 건수 상세",
-      refundCount: "환불 건수 상세",
     };
     const detailAmount = filteredSalesSummaryDetailItems.reduce((sum, sale) => sum + Number(sale.amount || 0), 0);
     return (
@@ -3028,7 +3887,7 @@ function App() {
               닫기
             </button>
           </div>
-          {(salesSummaryModal === "totalAmount" || salesSummaryModal === "totalCount" || salesSummaryModal === "refundCount") && (
+          {(salesSummaryModal === "totalAmount" || salesSummaryModal === "totalCount") && (
             <div className="summary-detail-stack">
               <div className="search-row">
                 <input
@@ -3041,10 +3900,17 @@ function App() {
                   지우기
                 </button>
               </div>
+              <label className="check-line filter-check-line">
+                <input
+                  type="checkbox"
+                  checked={hideRefundSales}
+                  onChange={(event) => setHideRefundSales(event.target.checked)}
+                />
+                환불정보 미표기
+              </label>
               <p className="sales-search-meta">
                 {salesSummaryModal === "totalAmount" && `검색 결과 ${filteredSalesSummaryDetailItems.length}건 · 합계 ${money(detailAmount)}`}
                 {salesSummaryModal === "totalCount" && `검색 결과 ${filteredSalesSummaryDetailItems.length}건`}
-                {salesSummaryModal === "refundCount" && `검색 결과 ${filteredSalesSummaryDetailItems.length}건 · 합계 ${money(detailAmount)}`}
               </p>
               {filteredSalesSummaryDetailItems.length === 0 ? (
                 <p className="empty">조건에 맞는 매출이 없습니다.</p>
@@ -3261,265 +4127,24 @@ function App() {
     );
   }
 
-  function renderSms() {
-    const excludedCount =
-      smsPreview?.eligible_recipients.filter((item) => smsExcludedRecipients.includes(smsRecipientKey(item))).length || 0;
-    const activeEligibleCount = (smsPreview?.eligible_recipients.length || 0) - excludedCount;
+  function renderSmsPreviewModal() {
     return (
-      <section className="page-section sms-page">
-        <div className="page-title-row">
-          <button type="button" onClick={openSmsGroupCreateModal}>
-            그룹 생성
-          </button>
-          <button type="button" className="secondary" onClick={openSmsTemplateCreateModal}>
-            템플릿 등록
-          </button>
-          <div className="section-title">
-            <p>문자발송</p>
-            <h1>대상 선택과 발송 이력</h1>
-          </div>
-        </div>
-
-        <section className="sms-layout">
-          <article className="form-panel sms-target-panel">
-            <div className="modal-title-row">
-              <div>
-                <h2>발송 대상</h2>
-                <p className="note-meta">전체 회원, 만료 예정, 그룹을 합쳐서 중복 없이 발송합니다.</p>
-              </div>
-              <button type="button" className="secondary" onClick={() => void refreshSmsData()}>
-                새로고침
-              </button>
-            </div>
-            <div className="sms-target-grid">
-              <label className="sms-check-card">
-                <span>
-                  <input
-                    type="checkbox"
-                    checked={smsComposeForm.include_all_members}
-                    onChange={(event) => setSmsComposeForm({ ...smsComposeForm, include_all_members: event.target.checked })}
-                  />
-                  전체 회원
-                </span>
-                <small>활성 회원 전체</small>
-              </label>
-              <label className="sms-check-card">
-                <span>
-                  <input
-                    type="checkbox"
-                    checked={smsComposeForm.include_expiring_memberships}
-                    onChange={(event) =>
-                      setSmsComposeForm({ ...smsComposeForm, include_expiring_memberships: event.target.checked })
-                    }
-                  />
-                  기간제 만료 예정
-                </span>
-                <div className="inline-number-field">
-                  <input
-                    inputMode="numeric"
-                    value={smsComposeForm.expiring_days}
-                    onChange={(event) => setSmsComposeForm({ ...smsComposeForm, expiring_days: digitsOnly(event.target.value) })}
-                  />
-                  <small>일 안에 만료</small>
-                </div>
-              </label>
-              <label className="sms-check-card">
-                <span>
-                  <input
-                    type="checkbox"
-                    checked={smsComposeForm.include_low_remaining_memberships}
-                    onChange={(event) =>
-                      setSmsComposeForm({ ...smsComposeForm, include_low_remaining_memberships: event.target.checked })
-                    }
-                  />
-                  횟수 만료 예정
-                </span>
-                <div className="inline-number-field">
-                  <input
-                    inputMode="numeric"
-                    value={smsComposeForm.low_remaining_count}
-                    onChange={(event) =>
-                      setSmsComposeForm({ ...smsComposeForm, low_remaining_count: digitsOnly(event.target.value) })
-                    }
-                  />
-                  <small>회 이하 남음</small>
-                </div>
-              </label>
-            </div>
-            <label>
-              그룹 선택
-              <select
-                multiple
-                size={Math.min(8, Math.max(4, smsGroups.length || 4))}
-                value={smsComposeForm.group_ids}
-                onChange={(event) => setSmsComposeForm({ ...smsComposeForm, group_ids: selectedValues(event) })}
-              >
-                {smsGroups.map((group) => (
-                  <option key={group.id} value={group.id}>
-                    {group.name} ({group.member_count}명)
-                  </option>
-                ))}
-              </select>
-            </label>
-            <div className="sms-mini-table">
-              <div className="modal-title-row">
-                <strong>등록 그룹</strong>
-                <span className="note-meta">{smsGroups.length}개</span>
-              </div>
-              {smsGroups.length === 0 ? (
-                <p className="empty">등록된 문자 그룹이 없습니다.</p>
-              ) : (
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>그룹명</th>
-                        <th>설명</th>
-                        <th>회원수</th>
-                        <th>관리</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {smsGroups.map((group) => (
-                        <tr key={group.id}>
-                          <td>
-                            <strong>{group.name}</strong>
-                          </td>
-                          <td className="memo-cell">{group.description || "-"}</td>
-                          <td>{group.member_count}명</td>
-                          <td>
-                            <div className="table-actions">
-                              <button type="button" className="secondary" onClick={() => openSmsGroupEditModal(group)}>
-                                수정
-                              </button>
-                              <button type="button" className="danger" onClick={() => void handleSmsGroupDelete(group)}>
-                                삭제
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
-          </article>
-
-          <article className="form-panel sms-compose-panel">
-            <div className="modal-title-row">
-              <div>
-                <h2>문자 작성</h2>
-                <p className="note-meta">광고용은 문자 수신 동의 회원만 발송 대상에 포함됩니다.</p>
-              </div>
-              <button type="button" className="secondary" onClick={openSmsTemplateCreateModal}>
-                템플릿 관리
-              </button>
-            </div>
-            <div className="form-grid">
-              <label>
-                문자 유형
-                <select
-                  value={smsComposeForm.content_type}
-                  onChange={(event) =>
-                    setSmsComposeForm({ ...smsComposeForm, content_type: event.target.value as SmsContentType })
-                  }
-                >
-                  <option value="COMM">일반용</option>
-                  <option value="AD">광고용</option>
-                </select>
-              </label>
-              <label>
-                템플릿
-                <select value={smsComposeForm.template_id} onChange={(event) => applySmsTemplate(event.target.value)}>
-                  <option value="">템플릿 선택 안함</option>
-                  {smsTemplates
-                    .filter((template) => template.is_active)
-                    .map((template) => (
-                      <option key={template.id} value={template.id}>
-                        {template.title}
-                      </option>
-                    ))}
-                </select>
-              </label>
-            </div>
-            <label>
-              제목
-              <input
-                value={smsComposeForm.title}
-                onChange={(event) => setSmsComposeForm({ ...smsComposeForm, title: event.target.value })}
-                placeholder="LMS로 보낼 때 제목을 입력합니다"
-              />
-            </label>
-            <label>
-              본문
-              <textarea
-                value={smsComposeForm.content}
-                onChange={(event) => setSmsComposeForm({ ...smsComposeForm, content: event.target.value })}
-                placeholder="발송할 문자 내용을 입력해 주세요"
-              />
-            </label>
-            <div className="form-actions">
-              <button type="button" className="secondary" onClick={() => void handleSmsPreview()}>
-                대상 미리보기
-              </button>
-              <button type="button" onClick={() => void handleSmsSend()}>
-                문자 발송
-              </button>
-            </div>
-            <div className="sms-mini-table">
-              <div className="modal-title-row">
-                <strong>등록 템플릿</strong>
-                <span className="note-meta">{smsTemplates.length}개</span>
-              </div>
-              {smsTemplates.length === 0 ? (
-                <p className="empty">등록된 템플릿이 없습니다.</p>
-              ) : (
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>제목</th>
-                        <th>사용여부</th>
-                        <th>내용</th>
-                        <th>관리</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {smsTemplates.map((template) => (
-                        <tr key={template.id}>
-                          <td>
-                            <strong>{template.title}</strong>
-                          </td>
-                          <td>{template.is_active ? "사용" : "중지"}</td>
-                          <td className="memo-cell">{template.content}</td>
-                          <td>
-                            <div className="table-actions">
-                              <button type="button" className="secondary" onClick={() => openSmsTemplateEditModal(template)}>
-                                수정
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
-          </article>
-        </section>
-
-        <section className="table-section sms-preview-section">
+      <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="sms-preview-title">
+        <section className="form-panel modal-panel sms-preview-modal-panel">
           <div className="modal-title-row">
             <div>
-              <h2>발송 대상 미리보기</h2>
+              <h2 id="sms-preview-title">{smsSendStep === "target" ? "포함 회원 확인" : "발송 대상 미리보기"}</h2>
               <p className="note-meta">
                 전체 {smsPreview?.summary.total_candidates || 0}명 · 발송 가능 {smsPreview?.summary.eligible_count || 0}명 ·
-                차단 {smsPreview?.summary.blocked_count || 0}명 · 제외 {excludedCount}명
+                차단 {smsPreview?.summary.blocked_count || 0}명
               </p>
             </div>
-            {smsPreview && <strong>{activeEligibleCount}명 최종 발송</strong>}
+            <div className="modal-title-actions">
+              {smsPreview && <strong>{smsPreview.summary.eligible_count}명 발송 가능</strong>}
+              <button type="button" className="secondary" onClick={() => setSmsPreviewModalOpen(false)}>
+                닫기
+              </button>
+            </div>
           </div>
           {smsPreview ? (
             <div className="summary-detail-stack">
@@ -3539,7 +4164,6 @@ function App() {
                   <table>
                     <thead>
                       <tr>
-                        <th>제외</th>
                         <th>이름</th>
                         <th>연락처</th>
                         <th>포함 기준</th>
@@ -3548,13 +4172,6 @@ function App() {
                     <tbody>
                       {filteredSmsPreviewEligible.map((item) => (
                         <tr key={smsRecipientKey(item)}>
-                          <td>
-                            <input
-                              type="checkbox"
-                              checked={smsExcludedRecipients.includes(smsRecipientKey(item))}
-                              onChange={() => toggleSmsRecipientExclusion(item)}
-                            />
-                          </td>
                           <td>{item.recipient_name}</td>
                           <td>{displayPhone(item.phone)}</td>
                           <td className="memo-cell">{item.source_labels.join(", ")}</td>
@@ -3593,13 +4210,22 @@ function App() {
             <p className="empty">대상 미리보기를 누르면 발송 가능/차단 대상을 바로 확인할 수 있습니다.</p>
           )}
         </section>
+      </div>
+    );
+  }
 
-        <section className="table-section">
+  function renderSmsHistoryModal() {
+    return (
+      <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="sms-history-title">
+        <section className="form-panel modal-panel summary-modal-panel">
           <div className="modal-title-row">
             <div>
-              <h2>발송 이력</h2>
-              <p className="note-meta">최근 50건 기준입니다.</p>
+              <h2 id="sms-history-title">발송 이력</h2>
+              <p className="note-meta">최근 50건 기준입니다. 총 {smsHistory.length}건</p>
             </div>
+            <button type="button" className="secondary" onClick={() => setSmsHistoryModalOpen(false)}>
+              닫기
+            </button>
           </div>
           {smsHistory.length === 0 ? (
             <p className="empty">등록된 문자 발송 이력이 없습니다.</p>
@@ -3632,6 +4258,9 @@ function App() {
                       <td>{message.status}</td>
                       <td>
                         <div className="table-actions">
+                          <button type="button" className="secondary" onClick={() => setSmsHistoryMessageTarget(message)}>
+                            메시지
+                          </button>
                           <button type="button" className="secondary" onClick={() => void openSmsHistoryDetail(message)}>
                             상세
                           </button>
@@ -3644,6 +4273,439 @@ function App() {
             </div>
           )}
         </section>
+      </div>
+    );
+  }
+
+  function renderSms() {
+    const smsTargetReady = hasSmsTargetSelection(smsComposeForm);
+    const smsContentReady = smsComposeForm.content.trim().length > 0;
+    const currentStepIndex = SMS_SEND_STEPS.findIndex((step) => step.key === smsSendStep);
+    const excludedCount =
+      smsPreview?.eligible_recipients.filter((item) => smsExcludedRecipients.includes(smsRecipientKey(item))).length || 0;
+    const activeEligibleCount = (smsPreview?.eligible_recipients.length || 0) - excludedCount;
+    const selectedGroupNames = smsGroups
+      .filter((group) => smsComposeForm.group_ids.includes(String(group.id)))
+      .map((group) => group.name);
+
+    function smsStepDisabled(step: SmsSendStep) {
+      if (step === "content") return !smsTargetReady;
+      if (step === "review") return !smsTargetReady || !smsContentReady;
+      if (step === "done") return !smsLastSentMessage;
+      return false;
+    }
+
+    function handleSmsStepClick(step: SmsSendStep) {
+      if (step === "target") {
+        setSmsSendStep("target");
+      } else if (step === "content") {
+        moveToSmsContentStep();
+      } else if (step === "review") {
+        moveToSmsReviewStep();
+      } else if (smsLastSentMessage) {
+        setSmsSendStep("done");
+      }
+    }
+
+    return (
+      <section className="page-section sms-page">
+        <div className="page-title-row sms-toolbar">
+          <button type="button" onClick={openSmsGroupCreateModal}>
+            그룹 생성
+          </button>
+          <button type="button" className="secondary" onClick={openSmsTemplateCreateModal}>
+            템플릿 등록
+          </button>
+          <button type="button" className="secondary" onClick={() => setSmsHistoryModalOpen(true)}>
+            발송 이력 {smsHistory.length}건
+          </button>
+        </div>
+
+        <nav className="sms-step-nav" aria-label="문자 발송 단계">
+          {SMS_SEND_STEPS.map((step, index) => {
+            const isActive = smsSendStep === step.key;
+            const isComplete = index < currentStepIndex;
+            return (
+              <button
+                key={step.key}
+                type="button"
+                className={["sms-step-button", isActive ? "active" : "", isComplete ? "complete" : ""].filter(Boolean).join(" ")}
+                disabled={smsStepDisabled(step.key)}
+                aria-current={isActive ? "step" : undefined}
+                onClick={() => handleSmsStepClick(step.key)}
+              >
+                <span>{index + 1}</span>
+                {step.label}
+              </button>
+            );
+          })}
+          <button type="button" className="sms-step-button sms-step-reset-button" onClick={resetSmsSendFlow}>
+            처음부터
+          </button>
+        </nav>
+
+        {smsSendStep === "target" && (
+          <div className="sms-step-layout">
+            <article className="form-panel sms-flow-panel sms-target-panel">
+              <div className="modal-title-row">
+                <div>
+                  <h2>받는 사람</h2>
+                  <p className="note-meta">전체 회원, 만료 예정, 그룹을 합쳐서 중복 없이 발송합니다.</p>
+                </div>
+                <button type="button" className="secondary" onClick={() => void refreshSmsDataAndClearTarget()}>
+                  새로고침
+                </button>
+              </div>
+              <div className="sms-target-grid">
+                <label className="sms-check-card">
+                  <span>
+                    <input
+                      type="checkbox"
+                      checked={smsComposeForm.include_all_members}
+                      onChange={(event) => setSmsComposeForm({ ...smsComposeForm, include_all_members: event.target.checked })}
+                    />
+                    전체 회원
+                  </span>
+                  <small>활성 회원 전체</small>
+                </label>
+                <label className="sms-check-card">
+                  <span>
+                    <input
+                      type="checkbox"
+                      checked={smsComposeForm.include_expiring_memberships}
+                      onChange={(event) =>
+                        setSmsComposeForm({ ...smsComposeForm, include_expiring_memberships: event.target.checked })
+                      }
+                    />
+                    기간제 만료 예정
+                  </span>
+                  <div className="inline-number-field">
+                    <input
+                      inputMode="numeric"
+                      value={smsComposeForm.expiring_days}
+                      onChange={(event) => setSmsComposeForm({ ...smsComposeForm, expiring_days: digitsOnly(event.target.value) })}
+                    />
+                    <small>일 안에 만료</small>
+                  </div>
+                </label>
+                <label className="sms-check-card">
+                  <span>
+                    <input
+                      type="checkbox"
+                      checked={smsComposeForm.include_low_remaining_memberships}
+                      onChange={(event) =>
+                        setSmsComposeForm({ ...smsComposeForm, include_low_remaining_memberships: event.target.checked })
+                      }
+                    />
+                    횟수 만료 예정
+                  </span>
+                  <div className="inline-number-field">
+                    <input
+                      inputMode="numeric"
+                      value={smsComposeForm.low_remaining_count}
+                      onChange={(event) =>
+                        setSmsComposeForm({ ...smsComposeForm, low_remaining_count: digitsOnly(event.target.value) })
+                      }
+                    />
+                    <small>회 이하 남음</small>
+                  </div>
+                </label>
+                <label className="sms-check-card">
+                  <span>
+                    <input
+                      type="checkbox"
+                      checked={smsComposeForm.include_birthdays}
+                      onChange={(event) => setSmsComposeForm({ ...smsComposeForm, include_birthdays: event.target.checked })}
+                    />
+                    생일자
+                  </span>
+                  <div className="inline-number-field">
+                    <input
+                      inputMode="numeric"
+                      value={smsComposeForm.birthday_days}
+                      onChange={(event) => setSmsComposeForm({ ...smsComposeForm, birthday_days: digitsOnly(event.target.value) })}
+                    />
+                    <small>일 안에 생일</small>
+                  </div>
+                </label>
+              </div>
+              <div className="sms-group-select-panel">
+                <div className="sms-member-transfer-heading">
+                  <span>그룹 선택</span>
+                  <small>{smsComposeForm.group_ids.length}개 선택</small>
+                </div>
+                {smsGroups.length === 0 ? (
+                  <p className="empty">등록된 문자 그룹이 없습니다.</p>
+                ) : (
+                  <div className="sms-group-choice-list">
+                    {smsGroups.map((group) => {
+                      const groupId = String(group.id);
+                      const selected = smsComposeForm.group_ids.includes(groupId);
+                      return (
+                        <label key={group.id} className={`sms-group-choice ${selected ? "selected" : ""}`}>
+                          <input
+                            type="checkbox"
+                            checked={selected}
+                            onChange={() =>
+                              setSmsComposeForm((current) => ({
+                                ...current,
+                                group_ids: selected
+                                  ? current.group_ids.filter((item) => item !== groupId)
+                                  : [...current.group_ids, groupId]
+                              }))
+                            }
+                          />
+                          <span>
+                            <strong>{group.name}</strong>
+                            <small>
+                              {group.member_count}명 · {selected ? "선택됨" : "선택 안됨"}
+                            </small>
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+              <div className="sms-flow-summary">
+                <span>{smsTargetReady ? "대상 조건 선택됨" : "대상 조건을 선택해 주세요"}</span>
+                <span>선택 그룹: {selectedGroupNames.length ? selectedGroupNames.join(", ") : "없음"}</span>
+              </div>
+            </article>
+            <aside className="sms-side-actions" aria-label="받는 사람 단계 이동">
+              <button type="button" className="secondary" onClick={() => void handleSmsTargetPreview()} disabled={!smsTargetReady}>
+                포함 회원 확인
+              </button>
+              <button type="button" onClick={moveToSmsContentStep} disabled={!smsTargetReady}>
+                다음: 내용 입력
+              </button>
+            </aside>
+          </div>
+        )}
+
+        {smsSendStep === "content" && (
+          <div className="sms-step-layout">
+            <article className="form-panel sms-flow-panel sms-compose-panel">
+              <div className="modal-title-row">
+                <div>
+                  <h2>내용 입력</h2>
+                  <p className="note-meta">광고용은 문자 수신 동의 회원만 발송 대상에 포함됩니다.</p>
+                </div>
+              </div>
+              <div className="form-grid">
+                <label>
+                  문자 유형
+                  <select
+                    value={smsComposeForm.content_type}
+                    onChange={(event) =>
+                      setSmsComposeForm({ ...smsComposeForm, content_type: event.target.value as SmsContentType })
+                    }
+                  >
+                    <option value="COMM">일반용</option>
+                    <option value="AD">광고용</option>
+                  </select>
+                </label>
+                <label>
+                  템플릿
+                  <select value={smsComposeForm.template_id} onChange={(event) => applySmsTemplate(event.target.value)}>
+                    <option value="">템플릿 선택 안함</option>
+                    {smsTemplates
+                      .filter((template) => template.is_active)
+                      .map((template) => (
+                        <option key={template.id} value={template.id}>
+                          {template.title}
+                        </option>
+                      ))}
+                  </select>
+                </label>
+              </div>
+              <label>
+                제목
+                <input
+                  value={smsComposeForm.title}
+                  onChange={(event) => setSmsComposeForm({ ...smsComposeForm, title: event.target.value })}
+                  placeholder="LMS로 보낼 때 제목을 입력합니다"
+                />
+              </label>
+              <label className="sms-compose-content-field">
+                <span className="sms-compose-content-header">
+                  <span>본문</span>
+                  {renderAiAssistButton()}
+                </span>
+                <textarea
+                  className="sms-compose-content-input"
+                  value={smsComposeForm.content}
+                  onChange={(event) => setSmsComposeForm({ ...smsComposeForm, content: event.target.value })}
+                  placeholder="발송할 문자 내용을 입력해 주세요"
+                />
+              </label>
+            </article>
+            <aside className="sms-side-actions" aria-label="내용 입력 단계 이동">
+              <button type="button" className="secondary" onClick={() => setSmsSendStep("target")}>
+                이전: 받는 사람
+              </button>
+              <button type="button" onClick={() => void handleSmsPreview()} disabled={!smsContentReady}>
+                다음: 확인
+              </button>
+            </aside>
+          </div>
+        )}
+
+        {smsSendStep === "review" && (
+          <div className="sms-step-layout">
+            <article className="form-panel sms-flow-panel sms-review-panel">
+              <div className="modal-title-row">
+                <div>
+                  <h2>확인</h2>
+                  <p className="note-meta">
+                    전체 {smsPreview?.summary.total_candidates || 0}명 · 발송 가능 {smsPreview?.summary.eligible_count || 0}명 ·
+                    차단 {smsPreview?.summary.blocked_count || 0}명 · 제외 {excludedCount}명
+                  </p>
+                </div>
+                {smsPreview && <strong>{activeEligibleCount}명 최종 발송</strong>}
+              </div>
+              {smsPreview ? (
+                <div className="summary-detail-stack">
+                  <div className="search-row">
+                    <input
+                      className="large-input"
+                      placeholder="이름, 연락처, 그룹명을 입력하면 바로 찾습니다"
+                      value={smsPreviewKeyword}
+                      onChange={(event) => setSmsPreviewKeyword(event.target.value)}
+                    />
+                    <button type="button" className="secondary" onClick={() => setSmsPreviewKeyword("")}>
+                      지우기
+                    </button>
+                  </div>
+                  <div className="sms-preview-grid">
+                    <div className="sms-preview-column">
+                      <div className="sms-preview-heading">
+                        <strong>발송 가능</strong>
+                        <span>{filteredSmsPreviewEligible.length}명</span>
+                      </div>
+                      <div className="table-wrap">
+                        <table>
+                          <thead>
+                            <tr>
+                              <th>제외</th>
+                              <th>이름</th>
+                              <th>연락처</th>
+                              <th>포함 기준</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {filteredSmsPreviewEligible.map((item) => (
+                              <tr key={smsRecipientKey(item)}>
+                                <td>
+                                  <input
+                                    type="checkbox"
+                                    checked={smsExcludedRecipients.includes(smsRecipientKey(item))}
+                                    onChange={() => toggleSmsRecipientExclusion(item)}
+                                  />
+                                </td>
+                                <td>{item.recipient_name}</td>
+                                <td>{displayPhone(item.phone)}</td>
+                                <td className="memo-cell">{item.source_labels.join(", ")}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                        {filteredSmsPreviewEligible.length === 0 && <p className="empty">발송 가능한 대상이 없습니다.</p>}
+                      </div>
+                    </div>
+                    <div className="sms-preview-column">
+                      <div className="sms-preview-heading">
+                        <strong>차단</strong>
+                        <span>{filteredSmsPreviewBlocked.length}명</span>
+                      </div>
+                      <div className="table-wrap">
+                        <table>
+                          <thead>
+                            <tr>
+                              <th>이름</th>
+                              <th>연락처</th>
+                              <th>차단 사유</th>
+                              <th>포함 기준</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {filteredSmsPreviewBlocked.map((item) => (
+                              <tr key={smsRecipientKey(item)}>
+                                <td>{item.recipient_name}</td>
+                                <td>{displayPhone(item.phone)}</td>
+                                <td>{item.blocked_reason || "-"}</td>
+                                <td className="memo-cell">{item.source_labels.join(", ")}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                        {filteredSmsPreviewBlocked.length === 0 && <p className="empty">차단된 대상이 없습니다.</p>}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <p className="empty">대상 확인을 다시 실행해 주세요.</p>
+              )}
+            </article>
+            <aside className="sms-side-actions" aria-label="확인 단계 이동">
+              <button type="button" className="secondary" onClick={() => setSmsSendStep("content")}>
+                이전: 내용 입력
+              </button>
+              <button type="button" className="secondary" onClick={() => void handleSmsPreview()}>
+                대상 다시 확인
+              </button>
+              <button type="button" onClick={() => void handleSmsSend()} disabled={!smsPreview || activeEligibleCount <= 0}>
+                문자 발송
+              </button>
+            </aside>
+          </div>
+        )}
+
+        {smsSendStep === "done" && (
+          <div className="sms-step-layout">
+            <article className="form-panel sms-flow-panel sms-result-panel">
+              <div className="modal-title-row">
+                <div>
+                  <h2>결과</h2>
+                  <p className="note-meta">발송 상세와 수신자별 결과는 발송 이력에서 확인합니다.</p>
+                </div>
+              </div>
+              {smsLastSentMessage ? (
+                <div className="sms-result-grid">
+                  <div>
+                    <span>상태</span>
+                    <strong className={`status-chip ${smsLastSentMessage.status === "실패" ? "inactive" : "active"}`}>
+                      {smsLastSentMessage.status}
+                    </strong>
+                  </div>
+                  <div>
+                    <span>발송 대상</span>
+                    <strong>{smsLastSentMessage.target_count}명</strong>
+                  </div>
+                  <div>
+                    <span>성공</span>
+                    <strong>{smsLastSentMessage.success_count}명</strong>
+                  </div>
+                  <div>
+                    <span>실패</span>
+                    <strong>{smsLastSentMessage.fail_count}명</strong>
+                  </div>
+                </div>
+              ) : (
+                <p className="empty">아직 발송 결과가 없습니다.</p>
+              )}
+            </article>
+            <aside className="sms-side-actions" aria-label="결과 단계 이동">
+              <button type="button" onClick={resetSmsSendFlow}>
+                새 문자 발송
+              </button>
+              <button type="button" className="secondary" onClick={() => setSmsHistoryModalOpen(true)}>
+                발송 이력 보기
+              </button>
+            </aside>
+          </div>
+        )}
       </section>
     );
   }
@@ -3657,7 +4719,7 @@ function App() {
               <h2 id="sms-group-title">{smsEditingGroup ? "문자 그룹 수정" : "문자 그룹 생성"}</h2>
               <p className="note-meta">활성 회원만 그룹에 넣을 수 있습니다.</p>
             </div>
-            <button type="button" className="secondary" onClick={() => setSmsGroupModalOpen(false)}>
+            <button type="button" className="secondary" onClick={closeSmsGroupModal}>
               닫기
             </button>
           </div>
@@ -3678,24 +4740,70 @@ function App() {
               className="large-input"
               placeholder="이름, 연락처, 메모로 찾습니다"
               value={smsGroupMemberKeyword}
-              onChange={(event) => setSmsGroupMemberKeyword(event.target.value)}
+              onChange={(event) => {
+                setSmsGroupMemberKeyword(event.target.value);
+                setSmsGroupAvailableSelection([]);
+              }}
             />
           </label>
-          <label>
-            그룹 회원 선택
-            <select
-              multiple
-              size={12}
-              value={smsGroupForm.member_ids}
-              onChange={(event) => setSmsGroupForm({ ...smsGroupForm, member_ids: selectedValues(event) })}
-            >
-              {filteredSmsGroupMemberOptions.map((member) => (
-                <option key={member.id} value={member.id}>
-                  {member.name} / {displayPhone(member.phone)} / {member.memo || "메모 없음"}
-                </option>
-              ))}
-            </select>
-          </label>
+          <div className="sms-member-transfer-grid">
+            <label className="sms-member-transfer-column">
+              <span className="sms-member-transfer-heading">
+                <span>회원 목록</span>
+                <small>{smsGroupAvailableMembers.length}명</small>
+              </span>
+              <select
+                multiple
+                size={14}
+                value={smsGroupAvailableSelection}
+                onChange={(event) => setSmsGroupAvailableSelection(selectedValues(event))}
+              >
+                {smsGroupAvailableMembers.map((member) => (
+                  <option key={member.id} value={String(member.id)}>
+                    {smsMemberOptionLabel(member)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="sms-member-transfer-actions" aria-label="그룹 회원 이동">
+              <button
+                type="button"
+                className="secondary"
+                onClick={addSmsGroupMembers}
+                disabled={smsGroupAvailableSelection.length === 0}
+                aria-label="선택 회원 추가"
+              >
+                →
+              </button>
+              <button
+                type="button"
+                className="secondary"
+                onClick={removeSmsGroupMembers}
+                disabled={smsGroupSelectedSelection.length === 0}
+                aria-label="선택 회원 제거"
+              >
+                ←
+              </button>
+            </div>
+            <label className="sms-member-transfer-column">
+              <span className="sms-member-transfer-heading">
+                <span>그룹 회원</span>
+                <small>{smsGroupForm.member_ids.length}명</small>
+              </span>
+              <select
+                multiple
+                size={14}
+                value={smsGroupSelectedSelection}
+                onChange={(event) => setSmsGroupSelectedSelection(selectedValues(event))}
+              >
+                {smsGroupSelectedMembers.map((member) => (
+                  <option key={member.id} value={String(member.id)}>
+                    {smsMemberOptionLabel(member)}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
           <p className="sales-search-meta">선택 {smsGroupForm.member_ids.length}명</p>
           <button type="submit">{smsEditingGroup ? "그룹 수정" : "그룹 저장"}</button>
         </form>
@@ -3704,17 +4812,32 @@ function App() {
   }
 
   function renderSmsTemplateModal() {
+    const activeTemplateCount = smsTemplates.filter((template) => template.is_active).length;
     return (
       <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="sms-template-title">
-        <form className="form-panel modal-panel" onSubmit={handleSmsTemplateSubmit}>
+        <form className="form-panel modal-panel sms-template-modal-panel" onSubmit={handleSmsTemplateSubmit}>
           <div className="modal-title-row">
             <div>
               <h2 id="sms-template-title">{smsEditingTemplate ? "문자 템플릿 수정" : "문자 템플릿 등록"}</h2>
               <p className="note-meta">저장 후 작성 화면에서 바로 불러올 수 있습니다.</p>
             </div>
-            <button type="button" className="secondary" onClick={() => setSmsTemplateModalOpen(false)}>
-              닫기
-            </button>
+            <div className="modal-title-actions">
+              {smsEditingTemplate && (
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => {
+                    setSmsEditingTemplate(null);
+                    setSmsTemplateForm(emptySmsTemplateForm);
+                  }}
+                >
+                  새 템플릿
+                </button>
+              )}
+              <button type="button" className="secondary" onClick={() => setSmsTemplateModalOpen(false)}>
+                닫기
+              </button>
+            </div>
           </div>
           <label>
             제목
@@ -3723,9 +4846,13 @@ function App() {
               onChange={(event) => setSmsTemplateForm({ ...smsTemplateForm, title: event.target.value })}
             />
           </label>
-          <label>
-            내용
+          <label className="sms-compose-content-field">
+            <span className="sms-compose-content-header">
+              <span>내용</span>
+              {renderAiAssistButton()}
+            </span>
             <textarea
+              className="sms-template-content-input"
               value={smsTemplateForm.content}
               onChange={(event) => setSmsTemplateForm({ ...smsTemplateForm, content: event.target.value })}
             />
@@ -3739,7 +4866,87 @@ function App() {
             템플릿 사용
           </label>
           <button type="submit">{smsEditingTemplate ? "템플릿 수정" : "템플릿 저장"}</button>
+          <section className="sms-template-manage-section" aria-label="기존 문자 템플릿">
+            <div className="sms-member-transfer-heading">
+              <span>기존 템플릿</span>
+              <small>
+                전체 {smsTemplates.length}개 · 사용 {activeTemplateCount}개
+              </small>
+            </div>
+            {smsTemplates.length === 0 ? (
+              <p className="empty">등록된 문자 템플릿이 없습니다.</p>
+            ) : (
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>상태</th>
+                      <th>제목</th>
+                      <th>내용</th>
+                      <th>관리</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {smsTemplates.map((template) => (
+                      <tr key={template.id}>
+                        <td>
+                          <span className={`status-chip ${template.is_active ? "active" : "inactive"}`}>
+                            {template.is_active ? "사용" : "제외"}
+                          </span>
+                        </td>
+                        <td>{template.title}</td>
+                        <td className="memo-cell">{template.content}</td>
+                        <td>
+                          <div className="table-actions">
+                            <button type="button" className="secondary" onClick={() => openSmsTemplateEditModal(template)}>
+                              수정
+                            </button>
+                            <button type="button" className="danger" onClick={() => void handleSmsTemplateDelete(template)}>
+                              삭제
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
         </form>
+      </div>
+    );
+  }
+
+  function renderSmsHistoryMessageModal() {
+    if (!smsHistoryMessageTarget) return null;
+    return (
+      <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="sms-history-message-title">
+        <section className="form-panel modal-panel sms-history-message-panel">
+          <div className="modal-title-row">
+            <div>
+              <h2 id="sms-history-message-title">발송 메시지</h2>
+              <p className="note-meta">
+                {formatDateTime(smsHistoryMessageTarget.created_at)} · {smsHistoryMessageTarget.content_type} /{" "}
+                {smsHistoryMessageTarget.message_type} · {smsHistoryMessageTarget.target_count}명
+              </p>
+            </div>
+            <button type="button" className="secondary" onClick={() => setSmsHistoryMessageTarget(null)}>
+              닫기
+            </button>
+          </div>
+          <div className="summary-detail-stack">
+            <div className="sms-history-message-meta">
+              <span>제목</span>
+              <strong>{smsHistoryMessageTarget.title || "제목 없음"}</strong>
+            </div>
+            <div className="sms-history-message-meta">
+              <span>대상</span>
+              <strong>{smsTargetSummaryText(smsHistoryMessageTarget.target_summary)}</strong>
+            </div>
+            <pre className="sms-history-message-content">{smsHistoryMessageTarget.content}</pre>
+          </div>
+        </section>
       </div>
     );
   }

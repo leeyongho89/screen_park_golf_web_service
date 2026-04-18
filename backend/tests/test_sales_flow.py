@@ -179,6 +179,26 @@ def test_refund_keeps_dashboard_today_sales_at_zero(client):
     assert dashboard["today_sales"] == "0"
 
 
+def test_dashboard_current_member_count_only_counts_active_members(client):
+    first_member = client.post(
+        "/api/members",
+        json={"name": "현재회원A", "phone": "010-4646-5757"},
+    ).json()
+    client.post(
+        "/api/members",
+        json={"name": "현재회원B", "phone": "010-5858-6969"},
+    )
+
+    dashboard = client.get("/api/dashboard").json()
+    assert dashboard["current_member_count"] == 2
+
+    deactivate = client.patch(f"/api/members/{first_member['id']}/deactivate", json={})
+    assert deactivate.status_code == 200
+
+    dashboard_after_delete = client.get("/api/dashboard").json()
+    assert dashboard_after_delete["current_member_count"] == 1
+
+
 def test_member_list_includes_sales_amounts(client):
     sell_product = get_product(client, "판매")
     member = client.post(

@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -267,6 +267,76 @@ class SaleRefundRequest(BaseModel):
     operator_name: str | None = None
 
 
+class ReservationCreate(BaseModel):
+    bay_number: int = Field(ge=1, le=6)
+    member_id: int | None = None
+    customer_name: str | None = Field(default=None, max_length=80)
+    customer_phone: str | None = Field(default=None, max_length=30)
+    reservation_date: date
+    start_time: time
+    end_time: time
+    note: str | None = None
+    operator_name: str | None = None
+
+    @field_validator("customer_phone")
+    @classmethod
+    def validate_customer_phone(cls, value: str | None) -> str | None:
+        if value is None or value == "":
+            return None
+        normalized = normalize_phone(value)
+        if not normalized or len(normalized) < 8:
+            raise ValueError("휴대전화 번호를 확인해 주세요.")
+        return normalized
+
+
+class ReservationUpdate(BaseModel):
+    bay_number: int | None = Field(default=None, ge=1, le=6)
+    member_id: int | None = None
+    customer_name: str | None = Field(default=None, max_length=80)
+    customer_phone: str | None = Field(default=None, max_length=30)
+    reservation_date: date | None = None
+    start_time: time | None = None
+    end_time: time | None = None
+    note: str | None = None
+    operator_name: str | None = None
+
+    @field_validator("customer_phone")
+    @classmethod
+    def validate_customer_phone(cls, value: str | None) -> str | None:
+        if value is None or value == "":
+            return None
+        normalized = normalize_phone(value)
+        if not normalized or len(normalized) < 8:
+            raise ValueError("휴대전화 번호를 확인해 주세요.")
+        return normalized
+
+
+class ReservationStatusRequest(BaseModel):
+    note: str | None = None
+    operator_name: str | None = None
+
+
+class ReservationRead(BaseModel):
+    id: int
+    bay_number: int
+    member_id: int | None
+    member_name: str | None = None
+    member_phone: str | None = None
+    customer_name: str
+    customer_phone: str
+    reservation_date: date
+    start_time: time
+    end_time: time
+    status: str
+    note: str | None
+    operator_name: str | None
+    canceled_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class SalesBreakdownItem(BaseModel):
     label: str
     amount: Decimal
@@ -292,6 +362,7 @@ class SalesSummary(BaseModel):
 
 
 class DashboardSummary(BaseModel):
+    current_member_count: int
     today_new_members: int
     today_sales: Decimal
     month_sales: Decimal
@@ -336,6 +407,7 @@ class SmsTemplateBase(BaseModel):
 
 
 class SmsTemplateCreate(SmsTemplateBase):
+    is_active: bool = True
     operator_name: str | None = None
 
 
@@ -362,6 +434,8 @@ class SmsTargetSelection(BaseModel):
     expiring_days: int = Field(default=7, ge=1)
     include_low_remaining_memberships: bool = False
     low_remaining_count: int = Field(default=3, ge=0)
+    include_birthdays: bool = False
+    birthday_days: int = Field(default=0, ge=0)
     group_ids: list[int] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -371,6 +445,7 @@ class SmsTargetSelection(BaseModel):
                 self.include_all_members,
                 self.include_expiring_memberships,
                 self.include_low_remaining_memberships,
+                self.include_birthdays,
                 self.group_ids,
             ]
         ):

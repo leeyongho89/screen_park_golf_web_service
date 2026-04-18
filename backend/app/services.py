@@ -3,7 +3,7 @@ from decimal import Decimal
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import Session, joinedload
 
 from app import models, schemas
@@ -15,6 +15,10 @@ from app.utils import calculate_end_date, normalize_phone
 LEGACY_PRODUCT_TYPES = {"정기권": "기간제", "쿠폰": "횟수", "묶음티켓": "횟수"}
 MEMBERSHIP_PRODUCT_TYPES = {"기간제", "횟수"}
 KST = timezone(timedelta(hours=9))
+RESERVATION_OPEN_TIME = time(9, 0)
+RESERVATION_CLOSE_TIME = time(23, 0)
+RESERVATION_SLOT_MINUTES = 30
+RESERVATION_STATUSES = {"예약", "취소"}
 
 
 def fail(status_code: int, code: str, message: str) -> None:
@@ -25,7 +29,7 @@ def model_snapshot(obj: Any, fields: list[str]) -> dict[str, Any]:
     snapshot: dict[str, Any] = {}
     for field in fields:
         value = getattr(obj, field)
-        if isinstance(value, (date, datetime)):
+        if isinstance(value, (date, datetime, time)):
             snapshot[field] = value.isoformat()
         elif isinstance(value, Decimal):
             snapshot[field] = str(value)
@@ -293,6 +297,18 @@ def delete_product(db: Session, product_id: int) -> None:
         before_data=before,
     )
     db.commit()
+
+
+def normalize_legacy_reservation_statuses(db: Session) -> None:
+    result = db.execute(
+        update(models.Reservation)
+        .where(models.Reservation.status.not_in(RESERVATION_STATUSES))
+        .values(status="예약", updated_at=datetime.now(timezone.utc))
+    )
+    if result.rowcount:
+        db.commit()
+    else:
+        db.rollback()
 
 
 def create_member_membership(
@@ -786,6 +802,183 @@ def query_sales(
     return list(items), total
 
 
+def validate_reservation_window(start_time: time | None, end_time: time | None) -> None:
+    if start_time is None or end_time is None:
+        fail(400, "invalid_reservation_time", "예약 시작 시간과 종료 시간을 입력해 주세요.")
+    if start_time >= end_time:
+        fail(400, "invalid_reservation_time", "예약 종료 시간은 시작 시간보다 늦어야 합니다.")
+    if start_time < RESERVATION_OPEN_TIME or end_time > RESERVATION_CLOSE_TIME:
+        fail(400, "invalid_reservation_hours", "예약 가능 시간은 09:00부터 23:00까지입니다.")
+    for value in (start_time, end_time):
+        if value.second or value.microsecond or value.minute % RESERVATION_SLOT_MINUTES != 0:
+            fail(400, "invalid_reservation_slot", "예약 시간은 30분 단위로 입력해 주세요.")
+
+
+def resolve_reservation_customer(
+    db: Session,
+    member_id: int | None,
+    customer_name: str | None,
+    customer_phone: str | None,
+) -> tuple[models.Member | None, str, str]:
+    member = None
+    if member_id:
+        member = get_member_or_404(db, member_id)
+        if not member.is_active:
+            fail(400, "inactive_member", "비활성 회원은 예약에 연결할 수 없습니다.")
+        return member, member.name, member.phone
+
+    name = (customer_name or "").strip()
+    phone = normalize_phone(customer_phone)
+    if not name or not phone:
+        fail(400, "reservation_customer_required", "예약자 이름과 연락처를 입력해 주세요.")
+    return None, name, phone
+
+
+def ensure_reservation_not_conflicting(
+    db: Session,
+    reservation_date: date,
+    bay_number: int,
+    start_time: time,
+    end_time: time,
+    exclude_reservation_id: int | None = None,
+) -> None:
+    stmt = select(models.Reservation.id).where(
+        models.Reservation.reservation_date == reservation_date,
+        models.Reservation.bay_number == bay_number,
+        models.Reservation.status != "취소",
+        models.Reservation.start_time < end_time,
+        models.Reservation.end_time > start_time,
+    )
+    if exclude_reservation_id:
+        stmt = stmt.where(models.Reservation.id != exclude_reservation_id)
+    if db.scalar(stmt.limit(1)):
+        fail(409, "reservation_conflict", "같은 타석에 겹치는 예약이 있습니다.")
+
+
+def query_reservations(db: Session, target_date: date) -> list[models.Reservation]:
+    return list(
+        db.scalars(
+            select(models.Reservation)
+            .options(joinedload(models.Reservation.member))
+            .where(models.Reservation.reservation_date == target_date)
+            .order_by(models.Reservation.bay_number.asc(), models.Reservation.start_time.asc(), models.Reservation.id.asc())
+        ).all()
+    )
+
+
+def get_reservation_or_404(db: Session, reservation_id: int) -> models.Reservation:
+    reservation = db.scalars(
+        select(models.Reservation)
+        .options(joinedload(models.Reservation.member))
+        .where(models.Reservation.id == reservation_id)
+    ).first()
+    if not reservation:
+        fail(404, "reservation_not_found", "예약을 찾을 수 없습니다.")
+    return reservation
+
+
+def create_reservation(db: Session, payload: schemas.ReservationCreate) -> models.Reservation:
+    validate_reservation_window(payload.start_time, payload.end_time)
+    member, customer_name, customer_phone = resolve_reservation_customer(
+        db, payload.member_id, payload.customer_name, payload.customer_phone
+    )
+    ensure_reservation_not_conflicting(db, payload.reservation_date, payload.bay_number, payload.start_time, payload.end_time)
+    reservation = models.Reservation(
+        bay_number=payload.bay_number,
+        member_id=member.id if member else None,
+        customer_name=customer_name,
+        customer_phone=customer_phone,
+        reservation_date=payload.reservation_date,
+        start_time=payload.start_time,
+        end_time=payload.end_time,
+        status="예약",
+        note=payload.note,
+        operator_name=payload.operator_name,
+    )
+    db.add(reservation)
+    db.flush()
+    add_audit_log(
+        db,
+        action_type="예약 등록",
+        target_type="reservation",
+        target_id=reservation.id,
+        after_data=model_snapshot(
+            reservation,
+            ["id", "bay_number", "member_id", "customer_name", "customer_phone", "reservation_date", "start_time", "end_time", "status"],
+        ),
+        actor_name=payload.operator_name,
+    )
+    db.commit()
+    return get_reservation_or_404(db, reservation.id)
+
+
+def update_reservation(db: Session, reservation_id: int, payload: schemas.ReservationUpdate) -> models.Reservation:
+    reservation = get_reservation_or_404(db, reservation_id)
+    if reservation.status == "취소":
+        fail(400, "reservation_canceled", "취소된 예약은 수정할 수 없습니다.")
+    before = model_snapshot(
+        reservation,
+        ["bay_number", "member_id", "customer_name", "customer_phone", "reservation_date", "start_time", "end_time", "status", "note"],
+    )
+    data = payload.model_dump(exclude_unset=True, exclude={"operator_name"})
+    next_member_id = data.get("member_id", reservation.member_id)
+    next_name = data.get("customer_name", reservation.customer_name)
+    next_phone = data.get("customer_phone", reservation.customer_phone)
+    member, customer_name, customer_phone = resolve_reservation_customer(db, next_member_id, next_name, next_phone)
+    next_bay_number = data.get("bay_number", reservation.bay_number)
+    next_date = data.get("reservation_date", reservation.reservation_date)
+    next_start_time = data.get("start_time", reservation.start_time)
+    next_end_time = data.get("end_time", reservation.end_time)
+    validate_reservation_window(next_start_time, next_end_time)
+    ensure_reservation_not_conflicting(db, next_date, next_bay_number, next_start_time, next_end_time, reservation.id)
+
+    reservation.bay_number = next_bay_number
+    reservation.member_id = member.id if member else None
+    reservation.customer_name = customer_name
+    reservation.customer_phone = customer_phone
+    reservation.reservation_date = next_date
+    reservation.start_time = next_start_time
+    reservation.end_time = next_end_time
+    if "note" in data:
+        reservation.note = data["note"]
+    db.flush()
+    add_audit_log(
+        db,
+        action_type="예약 수정",
+        target_type="reservation",
+        target_id=reservation.id,
+        before_data=before,
+        after_data=model_snapshot(
+            reservation,
+            ["bay_number", "member_id", "customer_name", "customer_phone", "reservation_date", "start_time", "end_time", "status", "note"],
+        ),
+        actor_name=payload.operator_name,
+    )
+    db.commit()
+    return get_reservation_or_404(db, reservation.id)
+
+
+def cancel_reservation(db: Session, reservation_id: int, payload: schemas.ReservationStatusRequest) -> models.Reservation:
+    reservation = get_reservation_or_404(db, reservation_id)
+    before = model_snapshot(reservation, ["status", "canceled_at"])
+    reservation.status = "취소"
+    reservation.canceled_at = datetime.now(timezone.utc)
+    if payload.note:
+        reservation.note = payload.note
+    db.flush()
+    add_audit_log(
+        db,
+        action_type="예약 취소",
+        target_type="reservation",
+        target_id=reservation.id,
+        before_data=before,
+        after_data=model_snapshot(reservation, ["status", "canceled_at", "note"]),
+        actor_name=payload.operator_name,
+    )
+    db.commit()
+    return get_reservation_or_404(db, reservation.id)
+
+
 def query_member_memberships(
     db: Session,
     member_id: int | None,
@@ -914,6 +1107,7 @@ def dashboard_summary(
     sales_start = today - timedelta(days=max(1, sales_days) - 1)
     today_start = datetime.combine(today, time.min)
     tomorrow_start = today_start + timedelta(days=1)
+    current_member_count = db.scalar(select(func.count()).where(models.Member.is_active.is_(True))) or 0
     today_new_members = db.scalar(
         select(func.count()).where(
             models.Member.created_at >= datetime.combine(new_member_start, time.min),
@@ -944,6 +1138,7 @@ def dashboard_summary(
     ) or 0
     recent_sales = db.scalars(select(models.Sale).order_by(models.Sale.created_at.desc()).limit(5)).all()
     return schemas.DashboardSummary(
+        current_member_count=current_member_count,
         today_new_members=today_new_members,
         today_sales=Decimal(today_sales or 0),
         month_sales=Decimal(today_sales or 0),
@@ -1086,6 +1281,7 @@ def create_sms_template(db: Session, payload: schemas.SmsTemplateCreate) -> mode
     template = models.SmsTemplate(
         title=payload.title.strip(),
         content=payload.content.strip(),
+        is_active=payload.is_active,
         operator_name=payload.operator_name,
     )
     db.add(template)
@@ -1123,6 +1319,22 @@ def update_sms_template(db: Session, template_id: int, payload: schemas.SmsTempl
     db.commit()
     db.refresh(template)
     return template
+
+
+def delete_sms_template(db: Session, template_id: int) -> None:
+    template = get_sms_template_or_404(db, template_id)
+    before = {"title": template.title, "content": template.content, "is_active": template.is_active}
+    db.execute(update(models.SmsMessage).where(models.SmsMessage.template_id == template.id).values(template_id=None))
+    db.delete(template)
+    db.flush()
+    add_audit_log(
+        db,
+        action_type="문자 템플릿 삭제",
+        target_type="sms_template",
+        target_id=template_id,
+        before_data=before,
+    )
+    db.commit()
 
 
 def get_sms_provider() -> NaverSensSmsProvider:
@@ -1194,6 +1406,21 @@ def add_sms_candidate(
     candidates[key]["source_labels"].add(source_label)
 
 
+def birthday_within_days(birth_date: date | None, today_date: date, days: int) -> bool:
+    if birth_date is None:
+        return False
+    try:
+        next_birthday = birth_date.replace(year=today_date.year)
+    except ValueError:
+        next_birthday = date(today_date.year, 2, 28)
+    if next_birthday < today_date:
+        try:
+            next_birthday = birth_date.replace(year=today_date.year + 1)
+        except ValueError:
+            next_birthday = date(today_date.year + 1, 2, 28)
+    return 0 <= (next_birthday - today_date).days <= days
+
+
 def collect_sms_target_candidates(
     db: Session, payload: schemas.SmsTargetSelection
 ) -> tuple[list[dict[str, Any]], list[str], list[models.SmsGroup]]:
@@ -1248,6 +1475,19 @@ def collect_sms_target_candidates(
         for membership in memberships:
             if membership.member:
                 add_sms_candidate(candidates, member=membership.member, source_label=label)
+
+    if payload.include_birthdays:
+        label = "오늘 생일자" if payload.birthday_days == 0 else f"{payload.birthday_days}일 안 생일자"
+        labels.append(label)
+        today_date = date.today()
+        members = db.scalars(
+            select(models.Member)
+            .where(models.Member.is_active.is_(True), models.Member.birth_date.is_not(None))
+            .order_by(models.Member.name.asc(), models.Member.id.asc())
+        ).all()
+        for member in members:
+            if birthday_within_days(member.birth_date, today_date, payload.birthday_days):
+                add_sms_candidate(candidates, member=member, source_label=label)
 
     groups = load_sms_target_groups(db, payload.group_ids)
     for group in groups:
@@ -1440,6 +1680,8 @@ def send_sms_message(
             "expiring_days": payload.expiring_days,
             "include_low_remaining_memberships": payload.include_low_remaining_memberships,
             "low_remaining_count": payload.low_remaining_count,
+            "include_birthdays": payload.include_birthdays,
+            "birthday_days": payload.birthday_days,
             "eligible_count": len(eligible),
             "blocked_count": len(blocked),
             "excluded_count": excluded_count,

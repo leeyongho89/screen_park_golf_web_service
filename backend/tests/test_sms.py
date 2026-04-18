@@ -1,3 +1,5 @@
+from datetime import date, timedelta
+
 from app import services
 
 
@@ -92,18 +94,24 @@ def test_sms_group_and_template_crud(client):
 
     create_template = client.post(
         "/api/sms/templates",
-        json={"title": "만료 안내", "content": "안녕하세요. 만료 예정 안내입니다."},
+        json={"title": "만료 안내", "content": "안녕하세요. 만료 예정 안내입니다.", "is_active": False},
     )
     assert create_template.status_code == 201
     template = create_template.json()
     assert template["title"] == "만료 안내"
+    assert template["is_active"] is False
 
     update_template = client.put(
         f"/api/sms/templates/{template['id']}",
-        json={"title": "만료 안내 수정", "content": "수정된 안내입니다.", "is_active": False},
+        json={"title": "만료 안내 수정", "content": "수정된 안내입니다.", "is_active": True},
     )
     assert update_template.status_code == 200
-    assert update_template.json()["is_active"] is False
+    assert update_template.json()["is_active"] is True
+
+    delete_template = client.delete(f"/api/sms/templates/{template['id']}")
+    assert delete_template.status_code == 204
+    templates = client.get("/api/sms/templates").json()["items"]
+    assert all(item["id"] != template["id"] for item in templates)
 
 
 def test_sms_preview_blocks_ad_members_without_sms_agree(client):
@@ -138,6 +146,45 @@ def test_sms_preview_blocks_ad_members_without_sms_agree(client):
     assert data["summary"]["eligible_count"] == 1
     assert data["summary"]["blocked_count"] == 1
     assert data["blocked_recipients"][0]["blocked_reason"] == "문자 수신 미동의"
+
+
+def test_sms_preview_can_target_upcoming_birthdays(client):
+    today_date = date.today()
+    upcoming_birthday = today_date + timedelta(days=3)
+    upcoming_birth_year = 1992 if (upcoming_birthday.month, upcoming_birthday.day) == (2, 29) else 1990
+    client.post(
+        "/api/members",
+        json={
+            "name": "생일대상",
+            "phone": "010-1111-2222",
+            "birth_date": upcoming_birthday.replace(year=upcoming_birth_year).isoformat(),
+        },
+    )
+    excluded_birthday = today_date + timedelta(days=20)
+    excluded_birth_year = 1992 if (excluded_birthday.month, excluded_birthday.day) == (2, 29) else 1990
+    client.post(
+        "/api/members",
+        json={
+            "name": "생일제외",
+            "phone": "010-3333-4444",
+            "birth_date": excluded_birthday.replace(year=excluded_birth_year).isoformat(),
+        },
+    )
+
+    preview = client.post(
+        "/api/sms/recipients/preview",
+        json={
+            "include_birthdays": True,
+            "birthday_days": 7,
+            "content_type": "COMM",
+        },
+    )
+
+    assert preview.status_code == 200
+    data = preview.json()
+    assert data["summary"]["eligible_count"] == 1
+    assert data["eligible_recipients"][0]["recipient_name"] == "생일대상"
+    assert data["eligible_recipients"][0]["source_labels"] == ["7일 안 생일자"]
 
 
 def test_sms_send_saves_history_and_recipient_details(client, monkeypatch):

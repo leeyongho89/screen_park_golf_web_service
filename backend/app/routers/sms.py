@@ -47,6 +47,12 @@ def update_sms_template(
     return schemas.SmsTemplateRead.model_validate(services.update_sms_template(db, template_id, payload))
 
 
+@router.delete("/templates/{template_id}", status_code=204)
+def delete_sms_template(template_id: int, db: Session = Depends(get_db)) -> Response:
+    services.delete_sms_template(db, template_id)
+    return Response(status_code=204)
+
+
 @router.post("/recipients/preview", response_model=schemas.SmsPreviewResponse)
 def preview_sms_recipients(payload: schemas.SmsPreviewRequest, db: Session = Depends(get_db)) -> schemas.SmsPreviewResponse:
     return services.preview_sms_recipients(db, payload)

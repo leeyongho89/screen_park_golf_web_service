@@ -9,6 +9,7 @@
 - 매출 등록, 일별/월별 요약, 환불 처리
 - 정기권 구매 및 쿠폰 구매 매출 저장 시 회원 보유권 자동 생성
 - 쿠폰 1회 차감, 잔여 횟수 보정, 정지/재개, 사용 로그 저장
+- 문자 그룹, 템플릿, 대상 미리보기, 발송 이력 관리
 - 감사 로그 저장
 - React 운영 화면과 Docker Compose 실행 환경
 
@@ -81,4 +82,5 @@ docker compose run --rm backend python scripts/import_members_from_raw.py --appl
 - `.env`, 업로드 파일, 백업 파일, `db/raw/`의 원천 자료는 Git에 커밋하지 않습니다.
 - 최초 PostgreSQL 컨테이너 생성 시 `db/migrations/001_initial_schema.sql`이 실행됩니다.
 - 이미 생성된 DB 볼륨에 스키마를 다시 적용하려면 마이그레이션 절차를 별도로 수행해야 합니다.
-- 문자 발송과 문서관리는 설계서상 2단계 범위이므로 DB 초안만 준비되어 있습니다.
+- 문자 발송을 실제로 사용하려면 `.env`에 `NCP_SMS_SERVICE_ID`, `NCP_ACCESS_KEY`, `NCP_SECRET_KEY`, `NCP_SMS_FROM_NUMBER`를 설정해야 합니다.
+- 문서관리는 설계서상 2단계 범위이므로 DB 초안만 준비되어 있습니다.

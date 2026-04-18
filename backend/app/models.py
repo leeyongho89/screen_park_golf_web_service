@@ -1,7 +1,7 @@
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, Text, Time, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
@@ -34,6 +34,7 @@ class Member(Base, TimestampMixin):
     memberships: Mapped[list["MemberMembership"]] = relationship(back_populates="member")
     sms_group_memberships: Mapped[list["SmsGroupMember"]] = relationship(back_populates="member")
     sms_recipients: Mapped[list["SmsMessageRecipient"]] = relationship(back_populates="member")
+    reservations: Mapped[list["Reservation"]] = relationship(back_populates="member")
 
 
 Index("ix_members_name", Member.name)
@@ -150,6 +151,37 @@ class Sale(Base, TimestampMixin):
 Index("ix_sales_sale_type", Sale.sale_type)
 Index("ix_sales_payment_method", Sale.payment_method)
 Index("ix_sales_status", Sale.status)
+
+
+class Reservation(Base, TimestampMixin):
+    __tablename__ = "reservations"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    bay_number: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    member_id: Mapped[int | None] = mapped_column(ForeignKey("members.id"), index=True)
+    customer_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    customer_phone: Mapped[str] = mapped_column(String(30), nullable=False)
+    reservation_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    start_time: Mapped[time] = mapped_column(Time, nullable=False)
+    end_time: Mapped[time] = mapped_column(Time, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), default="예약", nullable=False, index=True)
+    note: Mapped[str | None] = mapped_column(Text)
+    operator_name: Mapped[str | None] = mapped_column(String(80))
+    canceled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    member: Mapped[Member | None] = relationship(back_populates="reservations")
+
+    @property
+    def member_name(self) -> str | None:
+        return self.member.name if self.member else None
+
+    @property
+    def member_phone(self) -> str | None:
+        return self.member.phone if self.member else None
+
+
+Index("ix_reservations_date_bay", Reservation.reservation_date, Reservation.bay_number)
+Index("ix_reservations_date_status", Reservation.reservation_date, Reservation.status)
 
 
 class AuditLog(Base):

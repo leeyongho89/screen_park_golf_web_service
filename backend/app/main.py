@@ -8,8 +8,8 @@ from fastapi.responses import JSONResponse
 
 from app.config import get_settings
 from app.database import Base, SessionLocal, engine
-from app.routers import dashboard, members, memberships, products, sales, sms
-from app.services import seed_default_products
+from app.routers import dashboard, members, memberships, products, reservations, sales, sms
+from app.services import normalize_legacy_reservation_statuses, seed_default_products
 
 
 FIELD_LABELS = {
@@ -26,6 +26,12 @@ FIELD_LABELS = {
     "total_count": "횟수",
     "duration_days": "유효 일수",
     "payment_method": "결제수단",
+    "bay_number": "타석",
+    "customer_name": "예약자명",
+    "customer_phone": "예약자 연락처",
+    "reservation_date": "예약일",
+    "start_time": "시작 시간",
+    "end_time": "종료 시간",
 }
 
 
@@ -61,6 +67,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     Base.metadata.create_all(bind=engine)
     with SessionLocal() as db:
         seed_default_products(db)
+        normalize_legacy_reservation_statuses(db)
     yield
 
 
@@ -102,4 +109,5 @@ app.include_router(members.router, prefix="/api")
 app.include_router(products.router, prefix="/api")
 app.include_router(memberships.router, prefix="/api")
 app.include_router(sales.router, prefix="/api")
+app.include_router(reservations.router, prefix="/api")
 app.include_router(sms.router, prefix="/api")
