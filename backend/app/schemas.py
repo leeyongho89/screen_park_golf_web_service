@@ -536,3 +536,20 @@ class SmsMessageRecipientRead(BaseModel):
     sent_at: datetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class SmsMonthlyBillingItemRead(BaseModel):
+    product_demand_type_code: str | None = None
+    product_demand_type_name: str | None = None
+    demand_amount: str
+    use_amount: str
+    write_date: datetime | None = None
+
+
+class SmsMonthlyBillingRead(BaseModel):
+    month: str
+    currency_code: str | None = None
+    currency_name: str | None = None
+    total_demand_amount: str
+    last_write_date: datetime | None = None
+    matched_items: list[SmsMonthlyBillingItemRead] = Field(default_factory=list)

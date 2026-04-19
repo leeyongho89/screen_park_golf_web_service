@@ -1,5 +1,6 @@
 from datetime import date, datetime, time, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+import re
 from typing import Any
 
 from fastapi import HTTPException
@@ -8,7 +9,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app import models, schemas
 from app.config import get_settings
-from app.sms_provider import NaverSensSmsProvider
+from app.sms_provider import NaverSensSmsProvider, NcloudBillingClient
 from app.utils import calculate_end_date, normalize_phone
 
 
@@ -1346,6 +1347,154 @@ def get_sms_provider() -> NaverSensSmsProvider:
         access_key=(settings.ncp_access_key or "").strip(),
         secret_key=(settings.ncp_secret_key or "").strip(),
         from_number=normalize_phone(settings.ncp_sms_from_number) or "",
+    )
+
+
+def get_ncloud_billing_client() -> NcloudBillingClient:
+    settings = get_settings()
+    if not (settings.ncp_access_key or "").strip() or not (settings.ncp_secret_key or "").strip():
+        fail(400, "ncloud_billing_not_configured", "NAVER Cloud Billing 조회를 위해 Access Key와 Secret Key 설정이 필요합니다.")
+    return NcloudBillingClient(
+        access_key=(settings.ncp_access_key or "").strip(),
+        secret_key=(settings.ncp_secret_key or "").strip(),
+    )
+
+
+def current_billing_month(now: datetime | None = None) -> str:
+    reference = now.astimezone(KST) if now else datetime.now(KST)
+    return reference.strftime("%Y%m")
+
+
+def normalize_billing_month(month: str | None) -> str:
+    if not month:
+        return current_billing_month()
+    normalized = month.strip()
+    if re.fullmatch(r"\d{6}", normalized):
+        year = int(normalized[:4])
+        month_value = int(normalized[4:])
+    else:
+        match = re.fullmatch(r"(\d{4})-(\d{2})", normalized)
+        if not match:
+            fail(400, "invalid_billing_month", "조회 월 형식은 YYYY-MM 또는 YYYYMM만 사용할 수 있습니다.")
+        year = int(match.group(1))
+        month_value = int(match.group(2))
+        normalized = f"{year:04d}{month_value:02d}"
+    if month_value < 1 or month_value > 12:
+        fail(400, "invalid_billing_month", "조회 월 형식을 확인해 주세요.")
+    return normalized
+
+
+def normalize_billing_text(value: str | None) -> str:
+    cleaned = re.sub(r"[^0-9a-zA-Z가-힣]+", " ", (value or "").lower())
+    return " ".join(cleaned.split())
+
+
+def billing_amount_to_decimal(value: Any) -> Decimal:
+    if value == "" or value is None:
+        return Decimal("0")
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return Decimal("0")
+
+
+def billing_amount_to_text(value: Any) -> str:
+    return str(billing_amount_to_decimal(value))
+
+
+def collect_billing_search_terms(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        terms: list[str] = []
+        for item in value.values():
+            terms.extend(collect_billing_search_terms(item))
+        return terms
+    if isinstance(value, list):
+        terms: list[str] = []
+        for item in value:
+            terms.extend(collect_billing_search_terms(item))
+        return terms
+    return []
+
+
+def is_sms_billing_item(item: dict[str, Any], keywords: list[str]) -> bool:
+    searchable_text = normalize_billing_text(" ".join(collect_billing_search_terms(item)))
+    if not any(keyword in searchable_text for keyword in keywords):
+        return False
+    excluded_terms = [
+        "alim",
+        "알림톡",
+        "brand message",
+        "브랜드 메시지",
+        "friendtalk",
+        "친구톡",
+        "kakao",
+    ]
+    if "sms" in searchable_text:
+        return True
+    return "simple easy notification service" in searchable_text and not any(term in searchable_text for term in excluded_terms)
+
+
+def get_sms_monthly_billing(
+    client: NcloudBillingClient | None = None,
+    month: str | None = None,
+) -> schemas.SmsMonthlyBillingRead:
+    target_month = normalize_billing_month(month)
+    keywords = [normalize_billing_text(item) for item in get_settings().sms_billing_keyword_list if normalize_billing_text(item)]
+    client = client or get_ncloud_billing_client()
+    try:
+        result = client.get_product_demand_cost_list(start_month=target_month, end_month=target_month)
+    except RuntimeError as exc:
+        fail(502, "ncloud_billing_error", f"네이버 클라우드 이달 청구금액을 조회하지 못했습니다. {exc}")
+
+    response = result.get("getProductDemandCostListResponse") if isinstance(result, dict) else None
+    if not isinstance(response, dict):
+        fail(502, "ncloud_billing_error", "네이버 클라우드 Billing 응답 형식을 확인할 수 없습니다.")
+
+    items = response.get("productDemandCostList") or []
+    if not isinstance(items, list):
+        fail(502, "ncloud_billing_error", "네이버 클라우드 Billing 항목을 해석할 수 없습니다.")
+
+    currency_code: str | None = None
+    currency_name: str | None = None
+    total_demand_amount = Decimal("0")
+    last_write_date: datetime | None = None
+    matched_items: list[schemas.SmsMonthlyBillingItemRead] = []
+
+    for raw_item in items:
+        if not isinstance(raw_item, dict):
+            continue
+        pay_currency = raw_item.get("payCurrency") if isinstance(raw_item.get("payCurrency"), dict) else {}
+        if not currency_code:
+            currency_code = pay_currency.get("code")
+            currency_name = pay_currency.get("codeName")
+        if not is_sms_billing_item(raw_item, keywords):
+            continue
+        product_demand_type = raw_item.get("productDemandType") if isinstance(raw_item.get("productDemandType"), dict) else {}
+        write_date = parse_provider_datetime(raw_item.get("writeDate"))
+        demand_amount = billing_amount_to_decimal(raw_item.get("demandAmount"))
+        total_demand_amount += demand_amount
+        if write_date and (last_write_date is None or write_date > last_write_date):
+            last_write_date = write_date
+        matched_items.append(
+            schemas.SmsMonthlyBillingItemRead(
+                product_demand_type_code=product_demand_type.get("code"),
+                product_demand_type_name=product_demand_type.get("codeName"),
+                demand_amount=str(demand_amount),
+                use_amount=billing_amount_to_text(raw_item.get("useAmount")),
+                write_date=write_date,
+            )
+        )
+
+    matched_items.sort(key=lambda item: billing_amount_to_decimal(item.demand_amount), reverse=True)
+    return schemas.SmsMonthlyBillingRead(
+        month=target_month,
+        currency_code=currency_code,
+        currency_name=currency_name,
+        total_demand_amount=str(total_demand_amount),
+        last_write_date=last_write_date,
+        matched_items=matched_items,
     )
 
 

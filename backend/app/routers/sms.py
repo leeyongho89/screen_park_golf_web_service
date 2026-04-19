@@ -7,6 +7,11 @@ from app.database import get_db
 router = APIRouter(prefix="/sms", tags=["sms"])
 
 
+@router.get("/monthly-billing", response_model=schemas.SmsMonthlyBillingRead)
+def get_sms_monthly_billing(month: str | None = Query(default=None)) -> schemas.SmsMonthlyBillingRead:
+    return services.get_sms_monthly_billing(month=month)
+
+
 @router.get("/groups")
 def list_sms_groups(db: Session = Depends(get_db)) -> dict:
     items = services.list_sms_groups(db)

@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     ncp_access_key: str | None = Field(default=None, alias="NCP_ACCESS_KEY")
     ncp_secret_key: str | None = Field(default=None, alias="NCP_SECRET_KEY")
     ncp_sms_from_number: str | None = Field(default=None, alias="NCP_SMS_FROM_NUMBER")
+    ncp_sms_billing_keywords: str | None = Field(default=None, alias="NCP_SMS_BILLING_KEYWORDS")
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -30,6 +31,11 @@ class Settings(BaseSettings):
                 (self.ncp_sms_from_number or "").strip(),
             ]
         )
+
+    @property
+    def sms_billing_keyword_list(self) -> list[str]:
+        raw_value = self.ncp_sms_billing_keywords or "simple & easy notification service,sens,sms"
+        return [item.strip() for item in raw_value.split(",") if item.strip()]
 
 
 @lru_cache

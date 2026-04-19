@@ -9,6 +9,7 @@ type SalesSummaryModalKey = "payment" | "product" | "member" | "day" | "totalAmo
 type DashboardMembershipModalKey = "expiring" | "lowCount";
 type SmsContentType = "COMM" | "AD";
 type SmsSendStep = "target" | "content" | "review" | "done";
+type SmsMonthlyBillingStatus = "idle" | "loading" | "ready" | "error";
 
 interface ListResult<T> {
   items: T[];
@@ -222,6 +223,23 @@ interface SmsMessageRecipient {
   fail_code?: string | null;
   fail_reason?: string | null;
   sent_at?: string | null;
+}
+
+interface SmsMonthlyBillingItem {
+  product_demand_type_code?: string | null;
+  product_demand_type_name?: string | null;
+  demand_amount: string;
+  use_amount: string;
+  write_date?: string | null;
+}
+
+interface SmsMonthlyBillingSummary {
+  month: string;
+  currency_code?: string | null;
+  currency_name?: string | null;
+  total_demand_amount: string;
+  last_write_date?: string | null;
+  matched_items: SmsMonthlyBillingItem[];
 }
 
 interface MemberForm {
@@ -507,6 +525,32 @@ function formatTime(value: string | null | undefined) {
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
+function formatBillingMonth(value: string | null | undefined) {
+  if (!value) return "-";
+  const match = /^(\d{4})(\d{2})$/.exec(value);
+  if (!match) return value;
+  return `${match[1]}년 ${Number(match[2])}월`;
+}
+
+function currentMonthValue() {
+  const date = new Date();
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}`;
+}
+
+function normalizeMonthValue(value: string | null | undefined) {
+  return /^\d{4}-\d{2}$/.test(value || "") ? String(value) : currentMonthValue();
+}
+
+function billingMonthQueryValue(value: string | null | undefined) {
+  return normalizeMonthValue(value).replace("-", "");
+}
+
+function formatCurrencyAmount(value: string | number | null | undefined, currencyCode: string | null | undefined) {
+  const amountText = Number(value || 0).toLocaleString("ko-KR");
+  if (!currencyCode || currencyCode === "KRW") return `${amountText}원`;
+  return `${amountText} ${currencyCode}`;
+}
+
 function addDays(startDate: string, durationDays?: number | null) {
   if (!startDate || !durationDays) return "";
   const date = parseDateValue(startDate);
@@ -734,6 +778,7 @@ function App() {
   const [smsGroupModalOpen, setSmsGroupModalOpen] = useState(false);
   const [smsGroupForm, setSmsGroupForm] = useState<SmsGroupForm>(emptySmsGroupForm);
   const [smsEditingGroup, setSmsEditingGroup] = useState<SmsGroup | null>(null);
+  const [smsDeleteGroupTarget, setSmsDeleteGroupTarget] = useState<SmsGroup | null>(null);
   const [smsGroupMemberKeyword, setSmsGroupMemberKeyword] = useState("");
   const [smsGroupAvailableSelection, setSmsGroupAvailableSelection] = useState<string[]>([]);
   const [smsGroupSelectedSelection, setSmsGroupSelectedSelection] = useState<string[]>([]);
@@ -745,6 +790,11 @@ function App() {
   const [smsHistoryDetailTarget, setSmsHistoryDetailTarget] = useState<SmsMessage | null>(null);
   const [smsHistoryDetailItems, setSmsHistoryDetailItems] = useState<SmsMessageRecipient[]>([]);
   const [smsHistoryDetailKeyword, setSmsHistoryDetailKeyword] = useState("");
+  const [smsMonthlyBillingModalOpen, setSmsMonthlyBillingModalOpen] = useState(false);
+  const [smsMonthlyBillingStatus, setSmsMonthlyBillingStatus] = useState<SmsMonthlyBillingStatus>("idle");
+  const [smsMonthlyBilling, setSmsMonthlyBilling] = useState<SmsMonthlyBillingSummary | null>(null);
+  const [smsMonthlyBillingError, setSmsMonthlyBillingError] = useState("");
+  const [smsMonthlyBillingMonth, setSmsMonthlyBillingMonth] = useState(currentMonthValue());
   const [currentTime, setCurrentTime] = useState(() => new Date());
   const currentTimeZone = useMemo(() => Intl.DateTimeFormat().resolvedOptions().timeZone || "로컬 시간", []);
 
@@ -1067,6 +1117,19 @@ function App() {
   async function refreshSmsGroups() {
     const result = await api<ListResult<SmsGroup>>("/sms/groups");
     setSmsGroups(result.items);
+    const availableGroupIds = new Set(result.items.map((group) => String(group.id)));
+    setSmsComposeForm((current) => {
+      const nextGroupIds = current.group_ids.filter((groupId) => availableGroupIds.has(groupId));
+      return nextGroupIds.length === current.group_ids.length ? current : { ...current, group_ids: nextGroupIds };
+    });
+    setSmsEditingGroup((current) => {
+      if (!current) return current;
+      return result.items.find((group) => group.id === current.id) || null;
+    });
+    setSmsDeleteGroupTarget((current) => {
+      if (!current) return current;
+      return result.items.find((group) => group.id === current.id) || null;
+    });
   }
 
   async function refreshSmsTemplates() {
@@ -1092,6 +1155,36 @@ function App() {
 
   async function refreshSmsData() {
     await Promise.all([refreshSmsGroups(), refreshSmsTemplates(), refreshSmsHistory(), refreshSmsMemberOptions()]);
+  }
+
+  async function loadSmsMonthlyBilling(month = smsMonthlyBillingMonth) {
+    setSmsMonthlyBillingStatus("loading");
+    setSmsMonthlyBillingError("");
+    try {
+      const params = new URLSearchParams({ month: billingMonthQueryValue(month) });
+      const result = await api<SmsMonthlyBillingSummary>(`/sms/monthly-billing?${params.toString()}`);
+      setSmsMonthlyBilling(result);
+      setSmsMonthlyBillingStatus("ready");
+    } catch (error) {
+      setSmsMonthlyBilling(null);
+      setSmsMonthlyBillingStatus("error");
+      setSmsMonthlyBillingError(error instanceof Error ? error.message : "월별 청구금액을 불러오지 못했습니다.");
+    }
+  }
+
+  function openSmsMonthlyBillingModal() {
+    const initialMonth = currentMonthValue();
+    setSmsMonthlyBillingModalOpen(true);
+    setSmsMonthlyBilling(null);
+    setSmsMonthlyBillingMonth(initialMonth);
+    void loadSmsMonthlyBilling(initialMonth);
+  }
+
+  function closeSmsMonthlyBillingModal() {
+    setSmsMonthlyBillingModalOpen(false);
+    setSmsMonthlyBilling(null);
+    setSmsMonthlyBillingStatus("idle");
+    setSmsMonthlyBillingError("");
   }
 
   async function refreshSmsDataAndClearTarget() {
@@ -1133,10 +1226,18 @@ function App() {
     setSmsGroupModalOpen(true);
   }
 
+  function openSmsGroupDeleteModal(group: SmsGroup) {
+    setSmsDeleteGroupTarget(group);
+  }
+
   function closeSmsGroupModal() {
     setSmsGroupModalOpen(false);
     setSmsGroupAvailableSelection([]);
     setSmsGroupSelectedSelection([]);
+  }
+
+  function closeSmsGroupDeleteModal() {
+    setSmsDeleteGroupTarget(null);
   }
 
   function addSmsGroupMembers() {
@@ -1404,6 +1505,11 @@ function App() {
       setSmsGroupForm(emptySmsGroupForm);
       setSmsGroupAvailableSelection([]);
       setSmsGroupSelectedSelection([]);
+      setSmsPreview(null);
+      setSmsPreviewModalOpen(false);
+      setSmsPreviewKeyword("");
+      setSmsExcludedRecipients([]);
+      setSmsLastSentMessage(null);
       await refreshSmsGroups();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "문자 그룹 저장에 실패했습니다.");
@@ -1412,12 +1518,19 @@ function App() {
     }
   }
 
-  async function handleSmsGroupDelete(group: SmsGroup) {
-    if (!window.confirm(`${group.name} 그룹을 삭제할까요?`)) return;
+  async function handleSmsGroupDelete() {
+    const targetGroup = smsDeleteGroupTarget;
+    if (!targetGroup) return;
     setLoading(true);
     try {
-      await api<void>(`/sms/groups/${group.id}`, { method: "DELETE" });
+      await api<void>(`/sms/groups/${targetGroup.id}`, { method: "DELETE" });
       setNotice("문자 그룹을 삭제했습니다.");
+      setSmsDeleteGroupTarget(null);
+      setSmsPreview(null);
+      setSmsPreviewModalOpen(false);
+      setSmsPreviewKeyword("");
+      setSmsExcludedRecipients([]);
+      setSmsLastSentMessage(null);
       await refreshSmsGroups();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "문자 그룹 삭제에 실패했습니다.");
@@ -2433,7 +2546,9 @@ function App() {
         {salesSummaryModal && renderSalesSummaryModal()}
         {SMS_FEATURE_VISIBLE && smsPreviewModalOpen && renderSmsPreviewModal()}
         {SMS_FEATURE_VISIBLE && smsGroupModalOpen && renderSmsGroupModal()}
+        {SMS_FEATURE_VISIBLE && smsDeleteGroupTarget && renderSmsGroupDeleteModal()}
         {SMS_FEATURE_VISIBLE && smsTemplateModalOpen && renderSmsTemplateModal()}
+        {SMS_FEATURE_VISIBLE && smsMonthlyBillingModalOpen && renderSmsMonthlyBillingModal()}
         {SMS_FEATURE_VISIBLE && smsHistoryModalOpen && renderSmsHistoryModal()}
         {SMS_FEATURE_VISIBLE && smsHistoryDetailTarget && renderSmsHistoryDetailModal()}
         {SMS_FEATURE_VISIBLE && smsHistoryMessageTarget && renderSmsHistoryMessageModal()}
@@ -4316,6 +4431,9 @@ function App() {
           <button type="button" className="secondary" onClick={openSmsTemplateCreateModal}>
             템플릿 등록
           </button>
+          <button type="button" className="secondary" onClick={openSmsMonthlyBillingModal}>
+            월별 청구금액
+          </button>
           <button type="button" className="secondary" onClick={() => setSmsHistoryModalOpen(true)}>
             발송 이력 {smsHistory.length}건
           </button>
@@ -4442,26 +4560,37 @@ function App() {
                       const groupId = String(group.id);
                       const selected = smsComposeForm.group_ids.includes(groupId);
                       return (
-                        <label key={group.id} className={`sms-group-choice ${selected ? "selected" : ""}`}>
-                          <input
-                            type="checkbox"
-                            checked={selected}
-                            onChange={() =>
-                              setSmsComposeForm((current) => ({
-                                ...current,
-                                group_ids: selected
-                                  ? current.group_ids.filter((item) => item !== groupId)
-                                  : [...current.group_ids, groupId]
-                              }))
-                            }
-                          />
-                          <span>
-                            <strong>{group.name}</strong>
-                            <small>
-                              {group.member_count}명 · {selected ? "선택됨" : "선택 안됨"}
-                            </small>
-                          </span>
-                        </label>
+                        <div key={group.id} className={`sms-group-choice ${selected ? "selected" : ""}`}>
+                          <label className="sms-group-choice-main">
+                            <input
+                              type="checkbox"
+                              checked={selected}
+                              onChange={() =>
+                                setSmsComposeForm((current) => ({
+                                  ...current,
+                                  group_ids: selected
+                                    ? current.group_ids.filter((item) => item !== groupId)
+                                    : [...current.group_ids, groupId]
+                                }))
+                              }
+                            />
+                            <span>
+                              <strong>{group.name}</strong>
+                              <small>
+                                {group.member_count}명 · {selected ? "선택됨" : "선택 안됨"}
+                              </small>
+                              <small className="sms-group-choice-description">{group.description || "설명 없음"}</small>
+                            </span>
+                          </label>
+                          <div className="sms-group-choice-actions">
+                            <button type="button" className="secondary" onClick={() => openSmsGroupEditModal(group)}>
+                              수정
+                            </button>
+                            <button type="button" className="danger" onClick={() => openSmsGroupDeleteModal(group)}>
+                              삭제
+                            </button>
+                          </div>
+                        </div>
                       );
                     })}
                   </div>
@@ -4811,6 +4940,69 @@ function App() {
     );
   }
 
+  function renderSmsGroupDeleteModal() {
+    if (!smsDeleteGroupTarget) return null;
+    const memberLookup = new Map(smsMemberOptions.map((member) => [member.id, member]));
+    const deleteTargetMembers = smsDeleteGroupTarget.member_ids
+      .map((memberId) => memberLookup.get(memberId) || null)
+      .filter((member): member is Member => member !== null);
+
+    return (
+      <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="sms-group-delete-title">
+        <section className="form-panel modal-panel sms-group-delete-panel">
+          <div className="modal-title-row">
+            <div>
+              <h2 id="sms-group-delete-title">문자 그룹 삭제</h2>
+              <p className="note-meta">아래 정보를 확인한 뒤 삭제합니다. 삭제 후에는 복구할 수 없습니다.</p>
+            </div>
+            <button type="button" className="secondary" onClick={closeSmsGroupDeleteModal}>
+              닫기
+            </button>
+          </div>
+          <div className="sms-group-delete-summary">
+            <div>
+              <span>그룹명</span>
+              <strong>{smsDeleteGroupTarget.name}</strong>
+            </div>
+            <div>
+              <span>설명</span>
+              <strong>{smsDeleteGroupTarget.description || "-"}</strong>
+            </div>
+            <div>
+              <span>회원 수</span>
+              <strong>{smsDeleteGroupTarget.member_count}명</strong>
+            </div>
+          </div>
+          <section className="sms-group-delete-members" aria-label="삭제 대상 그룹 회원">
+            <div className="sms-member-transfer-heading">
+              <span>포함 회원</span>
+              <small>{smsDeleteGroupTarget.member_count}명</small>
+            </div>
+            {deleteTargetMembers.length > 0 ? (
+              <div className="sms-group-delete-member-list">
+                {deleteTargetMembers.map((member) => (
+                  <span key={member.id} className="sms-group-delete-member">
+                    {smsMemberOptionLabel(member)}
+                  </span>
+                ))}
+              </div>
+            ) : (
+              <p className="empty">현재 불러온 활성 회원 목록에서 확인 가능한 회원이 없습니다.</p>
+            )}
+          </section>
+          <div className="form-actions sms-group-delete-actions">
+            <button type="button" className="secondary" onClick={closeSmsGroupDeleteModal}>
+              취소
+            </button>
+            <button type="button" className="danger" onClick={() => void handleSmsGroupDelete()}>
+              그룹 삭제
+            </button>
+          </div>
+        </section>
+      </div>
+    );
+  }
+
   function renderSmsTemplateModal() {
     const activeTemplateCount = smsTemplates.filter((template) => template.is_active).length;
     return (
@@ -4914,6 +5106,108 @@ function App() {
             )}
           </section>
         </form>
+      </div>
+    );
+  }
+
+  function renderSmsMonthlyBillingModal() {
+    const billing = smsMonthlyBilling;
+    const currencyCode = billing?.currency_code || "KRW";
+    const hasMatchedItems = (billing?.matched_items.length || 0) > 0;
+    const billingMonthLabel = formatBillingMonth(billing?.month || billingMonthQueryValue(smsMonthlyBillingMonth));
+
+    return (
+      <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="sms-monthly-billing-title">
+        <section className="form-panel modal-panel sms-billing-panel">
+          <div className="modal-title-row">
+            <div>
+              <h2 id="sms-monthly-billing-title">월별 청구금액</h2>
+              <p className="note-meta">NAVER Cloud Billing API 기준 문자 서비스 월 청구 항목입니다.</p>
+            </div>
+            <div className="modal-title-actions">
+              <button type="button" className="secondary" onClick={() => void loadSmsMonthlyBilling()}>
+                조회
+              </button>
+              <button type="button" className="secondary" onClick={closeSmsMonthlyBillingModal}>
+                닫기
+              </button>
+            </div>
+          </div>
+
+          <div className="sms-billing-toolbar">
+            <label className="sms-billing-month-field">
+              <span>조회 월</span>
+              <input
+                type="month"
+                value={normalizeMonthValue(smsMonthlyBillingMonth)}
+                onChange={(event) => setSmsMonthlyBillingMonth(event.target.value)}
+              />
+            </label>
+          </div>
+
+          {smsMonthlyBillingStatus === "loading" && <p className="empty">{billingMonthLabel} 청구금액을 조회하고 있습니다.</p>}
+
+          {smsMonthlyBillingStatus === "error" && (
+            <div className="summary-detail-stack">
+              <p className="empty">{smsMonthlyBillingError}</p>
+              <p className="note-meta">네이버 클라우드 Billing 권한, 인증키, 조회 월을 확인해 주세요.</p>
+            </div>
+          )}
+
+          {smsMonthlyBillingStatus === "ready" && billing && (
+            <div className="summary-detail-stack">
+              <div className="sms-billing-summary">
+                <div>
+                  <span>조회 월</span>
+                  <strong>{formatBillingMonth(billing.month)}</strong>
+                </div>
+                <div>
+                  <span>총 청구금액</span>
+                  <strong>{formatCurrencyAmount(billing.total_demand_amount, currencyCode)}</strong>
+                </div>
+                <div>
+                  <span>마지막 집계</span>
+                  <strong>{formatDateTime(billing.last_write_date)}</strong>
+                </div>
+              </div>
+              <div className="sms-history-message-meta">
+                <span>통화</span>
+                <strong>{billing.currency_name ? `${billing.currency_name} (${currencyCode})` : currencyCode}</strong>
+              </div>
+              {hasMatchedItems ? (
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>청구 항목</th>
+                        <th>코드</th>
+                        <th>사용금액</th>
+                        <th>청구금액</th>
+                        <th>집계시각</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {billing.matched_items.map((item, index) => (
+                        <tr key={`${item.product_demand_type_code || "billing"}-${index}`}>
+                          <td className="sms-billing-item-name">{item.product_demand_type_name || "-"}</td>
+                          <td>{item.product_demand_type_code || "-"}</td>
+                          <td>{formatCurrencyAmount(item.use_amount, currencyCode)}</td>
+                          <td>{formatCurrencyAmount(item.demand_amount, currencyCode)}</td>
+                          <td>{formatDateTime(item.write_date)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <div className="summary-detail-stack">
+                  <p className="empty">{billingMonthLabel}에 매칭된 문자 청구 항목이 없습니다.</p>
+                  <p className="note-meta">청구 집계 시점에 따라 선택한 월 항목이 아직 보이지 않을 수 있습니다.</p>
+                </div>
+              )}
+            </div>
+          )}
+        </section>
       </div>
     );
   }

@@ -8,20 +8,16 @@ from typing import Any
 import httpx
 
 
-class NaverSensSmsProvider:
+class NcloudApiClient:
     def __init__(
         self,
         *,
-        service_id: str,
         access_key: str,
         secret_key: str,
-        from_number: str,
-        base_url: str = "https://sens.apigw.ntruss.com",
+        base_url: str,
     ) -> None:
-        self.service_id = service_id
         self.access_key = access_key
         self.secret_key = secret_key
-        self.from_number = from_number
         self.base_url = base_url.rstrip("/")
 
     def _signature(self, method: str, uri: str, timestamp: str) -> str:
@@ -38,7 +34,14 @@ class NaverSensSmsProvider:
             "x-ncp-apigw-signature-v2": self._signature(method, uri, timestamp),
         }
 
-    def _request(self, method: str, path: str, *, params: dict[str, Any] | None = None, json_body: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         query_string = str(httpx.QueryParams(params or {}))
         uri = path if not query_string else f"{path}?{query_string}"
         response = httpx.request(
@@ -54,11 +57,26 @@ class NaverSensSmsProvider:
             try:
                 data = response.json()
                 if isinstance(data, dict):
-                    message = str(data.get("message") or data.get("error") or message)
+                    message = str(data.get("message") or data.get("errorMessage") or data.get("returnMessage") or data.get("error") or message)
             except json.JSONDecodeError:
                 pass
-            raise RuntimeError(message or "문자 발송 요청이 실패했습니다.")
+            raise RuntimeError(message or "Ncloud API 요청이 실패했습니다.")
         return response.json()
+
+
+class NaverSensSmsProvider(NcloudApiClient):
+    def __init__(
+        self,
+        *,
+        service_id: str,
+        access_key: str,
+        secret_key: str,
+        from_number: str,
+        base_url: str = "https://sens.apigw.ntruss.com",
+    ) -> None:
+        super().__init__(access_key=access_key, secret_key=secret_key, base_url=base_url)
+        self.service_id = service_id
+        self.from_number = from_number
 
     def send_messages(
         self,
@@ -96,3 +114,21 @@ class NaverSensSmsProvider:
     def get_message(self, *, message_id: str) -> dict[str, Any]:
         path = f"/sms/v2/services/{self.service_id}/messages/{message_id}"
         return self._request("GET", path)
+
+
+class NcloudBillingClient(NcloudApiClient):
+    def __init__(
+        self,
+        *,
+        access_key: str,
+        secret_key: str,
+        base_url: str = "https://billingapi.apigw.ntruss.com",
+    ) -> None:
+        super().__init__(access_key=access_key, secret_key=secret_key, base_url=base_url)
+
+    def get_product_demand_cost_list(self, *, start_month: str, end_month: str) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            "/billing/v1/cost/getProductDemandCostList",
+            params={"startMonth": start_month, "endMonth": end_month, "responseFormatType": "json"},
+        )
