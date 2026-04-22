@@ -4,7 +4,7 @@ from app import services
 
 
 class FakeSmsProvider:
-    def send_messages(self, *, recipients, content, title, content_type, message_type):
+    def send_messages(self, *, recipients, content, title, content_type, message_type, reserve_time=None, reserve_time_zone=None):
         return {
             "requestId": "REQ-001",
             "requestTime": "2026-04-12 10:00:00",
@@ -62,6 +62,17 @@ class FakeSmsProvider:
             ],
         }
 
+    def get_reservation_status(self, *, reserve_id):
+        return {
+            "reserveId": reserve_id,
+            "reserveTimeZone": "Asia/Seoul",
+            "reserveTime": "2026-05-01T13:00:00+09:00",
+            "reserveStatus": "READY",
+        }
+
+    def cancel_reservation(self, *, reserve_id):
+        return {}
+
 
 class DeferredSmsProvider(FakeSmsProvider):
     def __init__(self):
@@ -112,6 +123,89 @@ class DeferredSmsProvider(FakeSmsProvider):
                 }
             ],
         }
+
+
+class ScheduledSmsProvider(FakeSmsProvider):
+    def __init__(self):
+        self.request_index = 0
+        self.canceled_reservations = []
+        self.reserve_statuses = {}
+
+    def send_messages(self, *, recipients, content, title, content_type, message_type, reserve_time=None, reserve_time_zone=None):
+        if reserve_time:
+            self.request_index += 1
+            request_id = f"RSSA-00{self.request_index}"
+            self.reserve_statuses[request_id] = {
+                "reserveId": request_id,
+                "reserveTimeZone": reserve_time_zone or "Asia/Seoul",
+                "reserveTime": f"{reserve_time.replace(' ', 'T')}:00+09:00",
+                "reserveStatus": "READY",
+            }
+            return {
+                "requestId": request_id,
+                "requestTime": "2026-04-12 10:00:00",
+                "statusCode": "202",
+                "statusName": "success",
+            }
+        return super().send_messages(
+            recipients=recipients,
+            content=content,
+            title=title,
+            content_type=content_type,
+            message_type=message_type,
+        )
+
+    def get_reservation_status(self, *, reserve_id):
+        return self.reserve_statuses[reserve_id]
+
+    def cancel_reservation(self, *, reserve_id):
+        self.canceled_reservations.append(reserve_id)
+        if reserve_id in self.reserve_statuses:
+            self.reserve_statuses[reserve_id]["reserveStatus"] = "CANCELED"
+        return {}
+
+    def list_messages(self, *, request_id, page_size=100, page_index=0, next_token=None):
+        if request_id.startswith("RSSA-"):
+            return {
+                "statusCode": "202",
+                "statusName": "success",
+                "messages": [
+                    {
+                        "requestId": request_id,
+                        "messageId": "MSG-SCHEDULE-001",
+                        "requestTime": "2026-05-01 13:00:00",
+                        "completeTime": "2026-05-01 13:00:01",
+                        "to": "01011112222",
+                        "status": "COMPLETED",
+                        "statusCode": "0",
+                        "statusName": "success",
+                        "statusMessage": "",
+                    }
+                ],
+                "hasMore": False,
+            }
+        return super().list_messages(request_id=request_id, page_size=page_size, page_index=page_index, next_token=next_token)
+
+    def get_message(self, *, message_id):
+        if message_id == "MSG-SCHEDULE-001":
+            return {
+                "statusCode": "200",
+                "statusName": "success",
+                "messages": [
+                    {
+                        "requestId": "RSSA-001",
+                        "messageId": message_id,
+                        "requestTime": "2026-05-01 13:00:00",
+                        "completeTime": "2026-05-01 13:00:01",
+                        "status": "COMPLETED",
+                        "statusCode": "0",
+                        "statusName": "success",
+                        "statusMessage": "",
+                        "to": "01011112222",
+                    }
+                ],
+            }
+        return super().get_message(message_id=message_id)
 
 
 class FakeBillingClient:
@@ -327,6 +421,106 @@ def test_sms_history_syncs_pending_messages(client, monkeypatch):
     assert history_message["status"] == "완료"
     assert history_message["success_count"] == 1
     assert history_message["fail_count"] == 0
+
+
+def test_sms_schedule_crud(client, monkeypatch):
+    provider = ScheduledSmsProvider()
+    monkeypatch.setattr(services, "get_sms_provider", lambda: provider)
+
+    client.post("/api/members", json={"name": "예약회원", "phone": "010-1111-2222"})
+
+    create = client.post(
+        "/api/sms/schedules",
+        json={
+            "include_all_members": True,
+            "content_type": "COMM",
+            "content": "예약 문자입니다.",
+            "scheduled_at": "2026-05-01T13:00:00+09:00",
+            "excluded_member_ids": [],
+            "excluded_phones": [],
+        },
+    )
+
+    assert create.status_code == 201
+    schedule = create.json()
+    assert schedule["status"] == "예약"
+    assert schedule["provider_request_id"] == "RSSA-001"
+
+    schedules = client.get("/api/sms/schedules?size=10")
+    assert schedules.status_code == 200
+    assert schedules.json()["total"] == 1
+    assert schedules.json()["items"][0]["id"] == schedule["id"]
+
+    update = client.put(
+        f"/api/sms/schedules/{schedule['id']}",
+        json={
+            "include_all_members": True,
+            "content_type": "COMM",
+            "content": "예약 문자 수정입니다.",
+            "scheduled_at": "2026-05-01T15:00:00+09:00",
+            "excluded_member_ids": [],
+            "excluded_phones": [],
+        },
+    )
+
+    assert update.status_code == 200
+    updated = update.json()
+    assert updated["status"] == "예약"
+    assert updated["provider_request_id"] == "RSSA-002"
+    assert provider.canceled_reservations == ["RSSA-001"]
+
+    delete = client.delete(f"/api/sms/schedules/{schedule['id']}")
+
+    assert delete.status_code == 200
+    canceled = delete.json()
+    assert canceled["status"] == "예약취소"
+    assert provider.canceled_reservations == ["RSSA-001", "RSSA-002"]
+
+    schedules_after_delete = client.get("/api/sms/schedules?size=10")
+    assert schedules_after_delete.status_code == 200
+    assert schedules_after_delete.json()["total"] == 1
+    assert schedules_after_delete.json()["items"][0]["status"] == "예약취소"
+
+    history = client.get("/api/sms/history?size=10")
+    assert history.status_code == 200
+    assert history.json()["total"] == 0
+
+
+def test_sms_schedule_moves_to_history_after_delivery(client, monkeypatch):
+    provider = ScheduledSmsProvider()
+    monkeypatch.setattr(services, "get_sms_provider", lambda: provider)
+
+    client.post("/api/members", json={"name": "예약발송회원", "phone": "010-1111-2222"})
+
+    create = client.post(
+        "/api/sms/schedules",
+        json={
+            "include_all_members": True,
+            "content_type": "COMM",
+            "content": "예약 후 발송 문자입니다.",
+            "scheduled_at": "2026-05-01T13:00:00+09:00",
+            "excluded_member_ids": [],
+            "excluded_phones": [],
+        },
+    )
+
+    assert create.status_code == 201
+    schedule = create.json()
+    provider.reserve_statuses[schedule["provider_request_id"]]["reserveStatus"] = "DONE"
+
+    history = client.get("/api/sms/history?size=10")
+
+    assert history.status_code == 200
+    assert history.json()["total"] == 1
+    message = history.json()["items"][0]
+    assert message["id"] == schedule["id"]
+    assert message["status"] == "완료"
+    assert message["success_count"] == 1
+    assert message["scheduled_at"].startswith("2026-05-01T13:00:00")
+
+    schedules = client.get("/api/sms/schedules?size=10")
+    assert schedules.status_code == 200
+    assert schedules.json()["total"] == 0
 
 
 def test_sms_monthly_billing_returns_matching_items(client, monkeypatch):

@@ -61,6 +61,8 @@ class NcloudApiClient:
             except json.JSONDecodeError:
                 pass
             raise RuntimeError(message or "Ncloud API 요청이 실패했습니다.")
+        if not response.content:
+            return {}
         return response.json()
 
 
@@ -86,6 +88,8 @@ class NaverSensSmsProvider(NcloudApiClient):
         title: str | None,
         content_type: str,
         message_type: str,
+        reserve_time: str | None = None,
+        reserve_time_zone: str | None = None,
     ) -> dict[str, Any]:
         path = f"/sms/v2/services/{self.service_id}/messages"
         body: dict[str, Any] = {
@@ -98,6 +102,9 @@ class NaverSensSmsProvider(NcloudApiClient):
         }
         if message_type == "LMS":
             body["subject"] = title or ""
+        if reserve_time:
+            body["reserveTime"] = reserve_time
+            body["reserveTimeZone"] = reserve_time_zone or "Asia/Seoul"
         return self._request("POST", path, json_body=body)
 
     def list_messages(self, *, request_id: str, page_size: int = 100, page_index: int = 0, next_token: str | None = None) -> dict[str, Any]:
@@ -114,6 +121,14 @@ class NaverSensSmsProvider(NcloudApiClient):
     def get_message(self, *, message_id: str) -> dict[str, Any]:
         path = f"/sms/v2/services/{self.service_id}/messages/{message_id}"
         return self._request("GET", path)
+
+    def get_reservation_status(self, *, reserve_id: str) -> dict[str, Any]:
+        path = f"/sms/v2/services/{self.service_id}/reservations/{reserve_id}/reserve-status"
+        return self._request("GET", path)
+
+    def cancel_reservation(self, *, reserve_id: str) -> dict[str, Any]:
+        path = f"/sms/v2/services/{self.service_id}/reservations/{reserve_id}"
+        return self._request("DELETE", path)
 
 
 class NcloudBillingClient(NcloudApiClient):

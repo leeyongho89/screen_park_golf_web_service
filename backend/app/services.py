@@ -20,6 +20,9 @@ RESERVATION_OPEN_TIME = time(9, 0)
 RESERVATION_CLOSE_TIME = time(23, 0)
 RESERVATION_SLOT_MINUTES = 30
 RESERVATION_STATUSES = {"예약", "취소"}
+SMS_SCHEDULE_LIST_STATUSES = {"예약", "예약취소"}
+SMS_SCHEDULE_SYNC_STATUSES = {"예약", "발송중"}
+SMS_HISTORY_EXCLUDED_STATUSES = {"예약", "예약취소"}
 
 
 def fail(status_code: int, code: str, message: str) -> None:
@@ -88,6 +91,12 @@ def calculate_membership_end_date(start_date: date, duration_days: int | None, e
     return end_date
 
 
+def kst_date_range_bounds_utc(start_date: date, end_date: date | None = None) -> tuple[datetime, datetime]:
+    utc_start = datetime.combine(start_date, time.min, tzinfo=KST).astimezone(timezone.utc).replace(tzinfo=None)
+    utc_end = datetime.combine((end_date or start_date) + timedelta(days=1), time.min, tzinfo=KST).astimezone(timezone.utc)
+    return utc_start, utc_end.replace(tzinfo=None)
+
+
 def migrate_legacy_products(db: Session) -> None:
     products = db.scalars(select(models.MembershipProduct)).all()
     changed = False
@@ -135,7 +144,8 @@ def ensure_unique_active_phone(db: Session, phone: str, exclude_member_id: int |
 
 def create_member(db: Session, payload: schemas.MemberCreate) -> models.Member:
     ensure_unique_active_phone(db, payload.phone)
-    member = models.Member(**payload.model_dump(exclude={"operator_name"}))
+    now = datetime.now(KST)
+    member = models.Member(**payload.model_dump(exclude={"operator_name"}), created_at=now, updated_at=now)
     db.add(member)
     db.flush()
     add_audit_log(
@@ -743,9 +753,11 @@ def query_members(
             conditions.append(models.Member.phone.ilike(f"%{normalized}%"))
         stmt = stmt.where(or_(*conditions))
     if created_from:
-        stmt = stmt.where(models.Member.created_at >= datetime.combine(created_from, time.min))
+        created_from_utc, _ = kst_date_range_bounds_utc(created_from)
+        stmt = stmt.where(models.Member.created_at >= created_from_utc)
     if created_to:
-        stmt = stmt.where(models.Member.created_at < datetime.combine(created_to + timedelta(days=1), time.min))
+        _, created_to_utc = kst_date_range_bounds_utc(created_to)
+        stmt = stmt.where(models.Member.created_at < created_to_utc)
     total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
     items = db.scalars(stmt.order_by(models.Member.created_at.desc()).offset((page - 1) * size).limit(size)).all()
     return list(items), total
@@ -1106,13 +1118,12 @@ def dashboard_summary(
     today = date.today()
     new_member_start = today - timedelta(days=max(1, new_member_days) - 1)
     sales_start = today - timedelta(days=max(1, sales_days) - 1)
-    today_start = datetime.combine(today, time.min)
-    tomorrow_start = today_start + timedelta(days=1)
+    new_member_start_utc, tomorrow_start_utc = kst_date_range_bounds_utc(new_member_start, today)
     current_member_count = db.scalar(select(func.count()).where(models.Member.is_active.is_(True))) or 0
     today_new_members = db.scalar(
         select(func.count()).where(
-            models.Member.created_at >= datetime.combine(new_member_start, time.min),
-            models.Member.created_at < tomorrow_start,
+            models.Member.created_at >= new_member_start_utc,
+            models.Member.created_at < tomorrow_start_utc,
         )
     ) or 0
     today_sales = db.scalar(
@@ -1178,6 +1189,133 @@ def get_sms_message_or_404(db: Session, message_id: int) -> models.SmsMessage:
     if not message:
         fail(404, "sms_message_not_found", "문자 발송 이력을 찾을 수 없습니다.")
     return message
+
+
+def get_sms_schedule_or_404(db: Session, message_id: int) -> models.SmsMessage:
+    message = get_sms_message_or_404(db, message_id)
+    if message.scheduled_at is None:
+        fail(404, "sms_schedule_not_found", "문자 예약 정보를 찾을 수 없습니다.")
+    return message
+
+
+def normalize_sms_schedule_datetime(value: datetime) -> datetime:
+    localized = value if value.tzinfo is not None else value.replace(tzinfo=KST)
+    localized = localized.astimezone(KST).replace(second=0, microsecond=0)
+    return localized.astimezone(timezone.utc)
+
+
+def format_sms_reserve_time(value: datetime) -> tuple[str, str]:
+    localized = normalize_sms_schedule_datetime(value).astimezone(KST)
+    return localized.strftime("%Y-%m-%d %H:%M"), "Asia/Seoul"
+
+
+def validate_sms_schedule_datetime(value: datetime) -> datetime:
+    normalized = normalize_sms_schedule_datetime(value)
+    if normalized <= datetime.now(timezone.utc):
+        fail(400, "invalid_sms_schedule_time", "예약 발송 시각은 현재 시각보다 늦어야 합니다.")
+    return normalized
+
+
+def normalized_sms_target_config(
+    payload: schemas.SmsTargetSelection,
+    *,
+    content_type: str,
+    excluded_member_ids: list[int] | None = None,
+    excluded_phones: list[str] | None = None,
+) -> dict[str, Any]:
+    unique_excluded_phones = sorted(
+        {
+            normalized
+            for phone in (excluded_phones or [])
+            if (normalized := normalize_phone(phone))
+        }
+    )
+    return {
+        "group_ids": sorted(set(payload.group_ids)),
+        "include_all_members": payload.include_all_members,
+        "include_expiring_memberships": payload.include_expiring_memberships,
+        "expiring_days": payload.expiring_days,
+        "include_low_remaining_memberships": payload.include_low_remaining_memberships,
+        "low_remaining_count": payload.low_remaining_count,
+        "include_birthdays": payload.include_birthdays,
+        "birthday_days": payload.birthday_days,
+        "content_type": content_type,
+        "excluded_member_ids": sorted(set(excluded_member_ids or [])),
+        "excluded_phones": unique_excluded_phones,
+    }
+
+
+def sms_target_config_matches_summary(
+    summary: dict[str, Any] | None,
+    *,
+    payload: schemas.SmsTargetSelection,
+    content_type: str,
+    excluded_member_ids: list[int] | None = None,
+    excluded_phones: list[str] | None = None,
+) -> bool:
+    if not isinstance(summary, dict):
+        return False
+    current = normalized_sms_target_config(
+        payload,
+        content_type=content_type,
+        excluded_member_ids=excluded_member_ids,
+        excluded_phones=excluded_phones,
+    )
+    saved = {
+        key: summary.get(key)
+        for key in (
+            "group_ids",
+            "include_all_members",
+            "include_expiring_memberships",
+            "expiring_days",
+            "include_low_remaining_memberships",
+            "low_remaining_count",
+            "include_birthdays",
+            "birthday_days",
+            "content_type",
+            "excluded_member_ids",
+            "excluded_phones",
+        )
+    }
+    return current == saved
+
+
+def build_sms_target_summary(
+    payload: schemas.SmsTargetSelection,
+    *,
+    content_type: str,
+    labels: list[str],
+    groups: list[models.SmsGroup],
+    eligible_count: int,
+    blocked_count: int,
+    excluded_count: int,
+    excluded_member_ids: list[int] | None = None,
+    excluded_phones: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "labels": labels,
+        "group_ids": sorted(set(payload.group_ids)),
+        "group_names": [group.name for group in groups],
+        "include_all_members": payload.include_all_members,
+        "include_expiring_memberships": payload.include_expiring_memberships,
+        "expiring_days": payload.expiring_days,
+        "include_low_remaining_memberships": payload.include_low_remaining_memberships,
+        "low_remaining_count": payload.low_remaining_count,
+        "include_birthdays": payload.include_birthdays,
+        "birthday_days": payload.birthday_days,
+        "content_type": content_type,
+        "eligible_count": eligible_count,
+        "blocked_count": blocked_count,
+        "excluded_count": excluded_count,
+        "excluded_member_ids": sorted(set(excluded_member_ids or [])),
+        "excluded_phones": sorted(
+            {
+                normalized
+                for phone in (excluded_phones or [])
+                if (normalized := normalize_phone(phone))
+            }
+        ),
+    }
 
 
 def get_active_members_by_ids(db: Session, member_ids: list[int]) -> list[models.Member]:
@@ -1702,6 +1840,124 @@ def preview_sms_recipients(db: Session, payload: schemas.SmsPreviewRequest) -> s
     )
 
 
+def filter_sms_final_recipients(
+    eligible: list[schemas.SmsPreviewRecipientRead],
+    *,
+    excluded_member_ids: list[int],
+    excluded_phones: list[str],
+) -> tuple[list[schemas.SmsPreviewRecipientRead], int]:
+    excluded_member_id_set = set(excluded_member_ids)
+    excluded_phone_set = {
+        normalized
+        for phone in excluded_phones
+        if (normalized := normalize_phone(phone))
+    }
+    final_recipients: list[schemas.SmsPreviewRecipientRead] = []
+    excluded_count = 0
+    for item in eligible:
+        if (item.member_id is not None and item.member_id in excluded_member_id_set) or item.phone in excluded_phone_set:
+            excluded_count += 1
+            continue
+        final_recipients.append(item)
+    return final_recipients, excluded_count
+
+
+def build_sms_message_recipients(
+    message_id: int,
+    recipients: list[schemas.SmsPreviewRecipientRead],
+) -> list[models.SmsMessageRecipient]:
+    return [
+        models.SmsMessageRecipient(
+            sms_message_id=message_id,
+            member_id=item.member_id,
+            recipient_name=item.recipient_name,
+            phone=item.phone,
+            sms_agree=item.sms_agree,
+            source_labels=item.source_labels,
+            status="대기",
+        )
+        for item in recipients
+    ]
+
+
+def replace_sms_message_recipients(
+    message: models.SmsMessage,
+    recipients: list[schemas.SmsPreviewRecipientRead],
+) -> None:
+    message.recipients = [
+        models.SmsMessageRecipient(
+            member_id=item.member_id,
+            recipient_name=item.recipient_name,
+            phone=item.phone,
+            sms_agree=item.sms_agree,
+            source_labels=item.source_labels,
+            status="대기",
+        )
+        for item in recipients
+    ]
+
+
+def mark_sms_message_failed(message: models.SmsMessage, *, reason: str, status: str = "실패", fail_code: str | None = None) -> None:
+    now = datetime.now(timezone.utc)
+    message.status = status
+    message.sent_at = message.sent_at or now
+    message.success_count = 0
+    message.fail_count = len(message.recipients)
+    message.sync_completed_at = now
+    for recipient in message.recipients:
+        recipient.status = "실패"
+        recipient.fail_code = fail_code or recipient.fail_code
+        recipient.fail_reason = reason
+        recipient.sent_at = recipient.sent_at or now
+
+
+def build_sms_message(
+    payload: schemas.SmsTargetSelection,
+    *,
+    content: str,
+    title: str | None,
+    content_type: str,
+    template_id: int | None,
+    message_type: str,
+    target_count: int,
+    operator_name: str | None,
+    labels: list[str],
+    groups: list[models.SmsGroup],
+    eligible_count: int,
+    blocked_count: int,
+    excluded_count: int,
+    excluded_member_ids: list[int] | None = None,
+    excluded_phones: list[str] | None = None,
+    scheduled_at: datetime | None = None,
+) -> models.SmsMessage:
+    return models.SmsMessage(
+        target_type=labels[0] if len(labels) == 1 else "복합",
+        title=title,
+        content=content,
+        content_type=content_type,
+        message_type=message_type,
+        template_id=template_id,
+        target_count=target_count,
+        success_count=0,
+        fail_count=0,
+        status="예약" if scheduled_at else "대기",
+        provider_name="NAVER_SENS",
+        operator_name=operator_name,
+        target_summary=build_sms_target_summary(
+            payload,
+            content_type=content_type,
+            labels=labels,
+            groups=groups,
+            eligible_count=eligible_count,
+            blocked_count=blocked_count,
+            excluded_count=excluded_count,
+            excluded_member_ids=excluded_member_ids,
+            excluded_phones=excluded_phones,
+        ),
+        scheduled_at=scheduled_at,
+    )
+
+
 def apply_sms_delivery_result(recipient: models.SmsMessageRecipient, payload: dict[str, Any]) -> None:
     recipient.provider_message_id = payload.get("messageId") or recipient.provider_message_id
     recipient.sent_at = parse_provider_datetime(payload.get("completeTime") or payload.get("requestTime")) or recipient.sent_at
@@ -1729,6 +1985,9 @@ def apply_sms_delivery_result(recipient: models.SmsMessageRecipient, payload: di
 def update_sms_message_counts(message: models.SmsMessage) -> None:
     message.success_count = sum(1 for item in message.recipients if item.status == "성공")
     message.fail_count = sum(1 for item in message.recipients if item.status == "실패")
+    sent_times = [item.sent_at for item in message.recipients if item.sent_at]
+    if sent_times:
+        message.sent_at = min(sent_times)
     if not message.recipients:
         message.status = "실패"
         message.sync_completed_at = datetime.now(timezone.utc)
@@ -1738,6 +1997,52 @@ def update_sms_message_counts(message: models.SmsMessage) -> None:
         message.sync_completed_at = datetime.now(timezone.utc)
     elif message.success_count or any(item.status == "발송중" for item in message.recipients):
         message.status = "발송중"
+
+
+def sync_sms_schedule_status(
+    db: Session, message_id: int, provider: NaverSensSmsProvider | None = None
+) -> models.SmsMessage:
+    message = get_sms_schedule_or_404(db, message_id)
+    if not message.provider_request_id or message.status not in SMS_SCHEDULE_SYNC_STATUSES:
+        return message
+
+    provider = provider or get_sms_provider()
+    result = provider.get_reservation_status(reserve_id=message.provider_request_id)
+    reserve_status = str(result.get("reserveStatus") or "").upper()
+    reserve_time = parse_provider_datetime(result.get("reserveTime"))
+    if reserve_time:
+        message.scheduled_at = reserve_time
+
+    if reserve_status == "READY":
+        message.status = "예약"
+        db.commit()
+        return get_sms_message_or_404(db, message.id)
+
+    if reserve_status == "CANCELED":
+        message.status = "예약취소"
+        message.canceled_at = message.canceled_at or datetime.now(timezone.utc)
+        message.sync_completed_at = message.sync_completed_at or datetime.now(timezone.utc)
+        db.commit()
+        return get_sms_message_or_404(db, message.id)
+
+    if reserve_status in {"FAIL", "STALE", "SKIP"}:
+        mark_sms_message_failed(
+            message,
+            reason="예약 발송에 실패했습니다.",
+            fail_code=reserve_status,
+        )
+        db.commit()
+        return get_sms_message_or_404(db, message.id)
+
+    if reserve_status in {"PROCESSING", "DONE"}:
+        message.status = "발송중"
+        if reserve_time and not message.sent_at:
+            message.sent_at = reserve_time
+        db.flush()
+        return sync_sms_message_delivery(db, message.id, provider)
+
+    db.commit()
+    return get_sms_message_or_404(db, message.id)
 
 
 def sync_sms_message_delivery(
@@ -1781,9 +2086,33 @@ def sync_sms_message_delivery(
     return get_sms_message_or_404(db, message.id)
 
 
-def send_sms_message(
-    db: Session, payload: schemas.SmsSendRequest, provider: NaverSensSmsProvider | None = None
+def sync_sms_message_runtime_state(
+    db: Session, message_id: int, provider: NaverSensSmsProvider | None = None
 ) -> models.SmsMessage:
+    message = get_sms_message_or_404(db, message_id)
+    if not message.provider_request_id:
+        return message
+    if message.scheduled_at and message.status == "예약":
+        return sync_sms_schedule_status(db, message_id, provider)
+    if message.status == "발송중":
+        return sync_sms_message_delivery(db, message_id, provider)
+    return message
+
+
+def prepare_sms_dispatch_request(
+    db: Session,
+    payload: schemas.SmsSendRequest | schemas.SmsScheduleRequest,
+) -> tuple[
+    str,
+    str | None,
+    str,
+    list[str],
+    list[models.SmsGroup],
+    list[schemas.SmsPreviewRecipientRead],
+    list[schemas.SmsPreviewRecipientRead],
+    list[schemas.SmsPreviewRecipientRead],
+    int,
+]:
     content = payload.content.strip()
     if not content:
         fail(400, "empty_sms_content", "문자 내용을 입력해 주세요.")
@@ -1792,63 +2121,44 @@ def send_sms_message(
 
     items, labels, groups = collect_sms_target_candidates(db, payload)
     eligible, blocked = split_sms_preview_candidates(items, payload.content_type)
-    excluded_member_ids = set(payload.excluded_member_ids)
-    excluded_phones = {normalize_phone(phone) for phone in payload.excluded_phones if normalize_phone(phone)}
-
-    final_recipients: list[schemas.SmsPreviewRecipientRead] = []
-    excluded_count = 0
-    for item in eligible:
-        if (item.member_id is not None and item.member_id in excluded_member_ids) or item.phone in excluded_phones:
-            excluded_count += 1
-            continue
-        final_recipients.append(item)
+    final_recipients, excluded_count = filter_sms_final_recipients(
+        eligible,
+        excluded_member_ids=payload.excluded_member_ids,
+        excluded_phones=payload.excluded_phones,
+    )
     if not final_recipients:
         fail(400, "no_sms_recipients", "발송 가능한 대상이 없습니다.")
-
-    message_type = determine_sms_message_type(payload.title, content)
     title = (payload.title or "").strip() or None
-    message = models.SmsMessage(
-        target_type=labels[0] if len(labels) == 1 else "복합",
-        title=title,
+    message_type = determine_sms_message_type(title, content)
+    return content, title, message_type, labels, groups, eligible, blocked, final_recipients, excluded_count
+
+
+def send_sms_message(
+    db: Session, payload: schemas.SmsSendRequest, provider: NaverSensSmsProvider | None = None
+) -> models.SmsMessage:
+    content, title, message_type, labels, groups, eligible, blocked, final_recipients, excluded_count = prepare_sms_dispatch_request(
+        db, payload
+    )
+    message = build_sms_message(
+        payload,
         content=content,
+        title=title,
         content_type=payload.content_type,
-        message_type=message_type,
         template_id=payload.template_id,
+        message_type=message_type,
         target_count=len(final_recipients),
-        success_count=0,
-        fail_count=0,
-        status="대기",
-        provider_name="NAVER_SENS",
         operator_name=payload.operator_name,
-        target_summary={
-            "labels": labels,
-            "group_ids": sorted(set(payload.group_ids)),
-            "group_names": [group.name for group in groups],
-            "include_all_members": payload.include_all_members,
-            "include_expiring_memberships": payload.include_expiring_memberships,
-            "expiring_days": payload.expiring_days,
-            "include_low_remaining_memberships": payload.include_low_remaining_memberships,
-            "low_remaining_count": payload.low_remaining_count,
-            "include_birthdays": payload.include_birthdays,
-            "birthday_days": payload.birthday_days,
-            "eligible_count": len(eligible),
-            "blocked_count": len(blocked),
-            "excluded_count": excluded_count,
-        },
+        labels=labels,
+        groups=groups,
+        eligible_count=len(eligible),
+        blocked_count=len(blocked),
+        excluded_count=excluded_count,
+        excluded_member_ids=payload.excluded_member_ids,
+        excluded_phones=payload.excluded_phones,
     )
     db.add(message)
     db.flush()
-    recipients = [
-        models.SmsMessageRecipient(
-            sms_message_id=message.id,
-            member_id=item.member_id,
-            recipient_name=item.recipient_name,
-            phone=item.phone,
-            status="대기",
-        )
-        for item in final_recipients
-    ]
-    db.add_all(recipients)
+    db.add_all(build_sms_message_recipients(message.id, final_recipients))
     db.commit()
 
     provider = provider or get_sms_provider()
@@ -1890,14 +2200,7 @@ def send_sms_message(
         db.rollback()
         message = get_sms_message_or_404(db, message.id)
         failure_reason = str(exc) or "문자 발송 요청이 실패했습니다."
-        message.status = "실패"
-        message.sent_at = datetime.now(timezone.utc)
-        message.fail_count = message.target_count
-        message.sync_completed_at = datetime.now(timezone.utc)
-        for recipient in message.recipients:
-            recipient.status = "실패"
-            recipient.fail_reason = failure_reason
-            recipient.sent_at = message.sent_at
+        mark_sms_message_failed(message, reason=failure_reason)
         add_audit_log(
             db,
             action_type="문자 발송 실패",
@@ -1910,19 +2213,299 @@ def send_sms_message(
         return get_sms_message_or_404(db, message.id)
 
 
-def query_sms_history(db: Session, page: int, size: int) -> tuple[list[models.SmsMessage], int]:
-    stmt = select(models.SmsMessage)
-    total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    paged_stmt = stmt.order_by(models.SmsMessage.created_at.desc(), models.SmsMessage.id.desc()).offset((page - 1) * size).limit(size)
-    items = db.scalars(paged_stmt).all()
-    pending_ids = [item.id for item in items if item.status == "발송중" and item.provider_request_id]
-    if pending_ids:
-        for message_id in pending_ids:
+def create_sms_schedule(
+    db: Session, payload: schemas.SmsScheduleRequest, provider: NaverSensSmsProvider | None = None
+) -> models.SmsMessage:
+    scheduled_at = validate_sms_schedule_datetime(payload.scheduled_at)
+    content, title, message_type, labels, groups, eligible, blocked, final_recipients, excluded_count = prepare_sms_dispatch_request(
+        db, payload
+    )
+    message = build_sms_message(
+        payload,
+        content=content,
+        title=title,
+        content_type=payload.content_type,
+        template_id=payload.template_id,
+        message_type=message_type,
+        target_count=len(final_recipients),
+        operator_name=payload.operator_name,
+        labels=labels,
+        groups=groups,
+        eligible_count=len(eligible),
+        blocked_count=len(blocked),
+        excluded_count=excluded_count,
+        excluded_member_ids=payload.excluded_member_ids,
+        excluded_phones=payload.excluded_phones,
+        scheduled_at=scheduled_at,
+    )
+    db.add(message)
+    db.flush()
+    db.add_all(build_sms_message_recipients(message.id, final_recipients))
+    db.commit()
+
+    provider = provider or get_sms_provider()
+    reserve_time, reserve_time_zone = format_sms_reserve_time(scheduled_at)
+    try:
+        response = provider.send_messages(
+            recipients=[item.phone for item in final_recipients],
+            content=content,
+            title=title,
+            content_type=payload.content_type,
+            message_type=message_type,
+            reserve_time=reserve_time,
+            reserve_time_zone=reserve_time_zone,
+        )
+        request_id = str(response.get("requestId") or "").strip()
+        if not request_id:
+            raise RuntimeError("문자 예약 요청 ID를 받지 못했습니다.")
+        message = get_sms_schedule_or_404(db, message.id)
+        message.provider_request_id = request_id
+        message.status = "예약"
+        message.sent_at = None
+        message.canceled_at = None
+        db.flush()
+        add_audit_log(
+            db,
+            action_type="문자 예약 등록",
+            target_type="sms_message",
+            target_id=message.id,
+            after_data={
+                "target_count": message.target_count,
+                "content_type": message.content_type,
+                "status": message.status,
+                "scheduled_at": message.scheduled_at.isoformat() if message.scheduled_at else None,
+            },
+            actor_name=payload.operator_name,
+        )
+        db.commit()
+        return get_sms_schedule_or_404(db, message.id)
+    except Exception as exc:
+        db.rollback()
+        message = get_sms_schedule_or_404(db, message.id)
+        failure_reason = str(exc) or "문자 예약 요청이 실패했습니다."
+        mark_sms_message_failed(message, reason=failure_reason)
+        add_audit_log(
+            db,
+            action_type="문자 예약 실패",
+            target_type="sms_message",
+            target_id=message.id,
+            after_data={
+                "target_count": message.target_count,
+                "status": message.status,
+                "scheduled_at": message.scheduled_at.isoformat() if message.scheduled_at else None,
+                "fail_reason": failure_reason,
+            },
+            actor_name=payload.operator_name,
+        )
+        db.commit()
+        return get_sms_schedule_or_404(db, message.id)
+
+
+def update_sms_schedule(
+    db: Session, message_id: int, payload: schemas.SmsScheduleRequest, provider: NaverSensSmsProvider | None = None
+) -> models.SmsMessage:
+    message = sync_sms_message_runtime_state(db, message_id, provider)
+    message = get_sms_schedule_or_404(db, message.id)
+    if message.status != "예약":
+        fail(400, "sms_schedule_not_editable", "발송 전 예약만 수정할 수 있습니다.")
+    if not message.provider_request_id:
+        fail(400, "sms_schedule_invalid_state", "예약 요청 정보를 다시 확인해 주세요.")
+
+    scheduled_at = validate_sms_schedule_datetime(payload.scheduled_at)
+    preserve_existing_recipients = sms_target_config_matches_summary(
+        message.target_summary,
+        payload=payload,
+        content_type=payload.content_type,
+        excluded_member_ids=payload.excluded_member_ids,
+        excluded_phones=payload.excluded_phones,
+    )
+
+    title = (payload.title or "").strip() or None
+    content = payload.content.strip()
+    if not content:
+        fail(400, "empty_sms_content", "문자 내용을 입력해 주세요.")
+    if payload.template_id is not None:
+        get_sms_template_or_404(db, payload.template_id)
+    message_type = determine_sms_message_type(title, content)
+
+    if preserve_existing_recipients:
+        final_recipients = [
+            schemas.SmsPreviewRecipientRead(
+                member_id=item.member_id,
+                recipient_name=item.recipient_name or item.member_name or "",
+                phone=item.phone,
+                sms_agree=item.sms_agree,
+                source_labels=item.source_labels or [],
+            )
+            for item in message.recipients
+        ]
+        if not final_recipients:
+            fail(400, "no_sms_recipients", "발송 가능한 대상이 없습니다.")
+        target_summary = dict(message.target_summary or {})
+    else:
+        _, _, _, labels, groups, eligible, blocked, final_recipients, excluded_count = prepare_sms_dispatch_request(db, payload)
+        target_summary = build_sms_target_summary(
+            payload,
+            content_type=payload.content_type,
+            labels=labels,
+            groups=groups,
+            eligible_count=len(eligible),
+            blocked_count=len(blocked),
+            excluded_count=excluded_count,
+            excluded_member_ids=payload.excluded_member_ids,
+            excluded_phones=payload.excluded_phones,
+        )
+
+    provider = provider or get_sms_provider()
+    try:
+        reserve_time, reserve_time_zone = format_sms_reserve_time(scheduled_at)
+        response = provider.send_messages(
+            recipients=[item.phone for item in final_recipients],
+            content=content,
+            title=title,
+            content_type=payload.content_type,
+            message_type=message_type,
+            reserve_time=reserve_time,
+            reserve_time_zone=reserve_time_zone,
+        )
+        new_request_id = str(response.get("requestId") or "").strip()
+        if not new_request_id:
+            raise RuntimeError("문자 예약 요청 ID를 받지 못했습니다.")
+
+        try:
+            provider.cancel_reservation(reserve_id=message.provider_request_id)
+        except Exception:
             try:
-                sync_sms_message_delivery(db, message_id)
+                provider.cancel_reservation(reserve_id=new_request_id)
             except Exception:
-                db.rollback()
-        items = db.scalars(paged_stmt).all()
+                pass
+            raise RuntimeError("기존 예약을 취소하지 못했습니다.")
+    except Exception as exc:
+        fail(502, "sms_schedule_update_failed", str(exc) or "문자 예약 수정에 실패했습니다.")
+
+    before = model_snapshot(message, ["title", "content", "content_type", "message_type", "target_count", "status", "scheduled_at"])
+    message.target_type = target_summary.get("labels", [message.target_type])[0] if len(target_summary.get("labels", [])) == 1 else "복합"
+    message.title = title
+    message.content = content
+    message.content_type = payload.content_type
+    message.message_type = message_type
+    message.template_id = payload.template_id
+    message.target_count = len(final_recipients)
+    message.success_count = 0
+    message.fail_count = 0
+    message.status = "예약"
+    message.provider_name = "NAVER_SENS"
+    message.provider_request_id = new_request_id
+    message.target_summary = target_summary
+    message.scheduled_at = scheduled_at
+    message.sent_at = None
+    message.canceled_at = None
+    message.sync_completed_at = None
+    if payload.operator_name is not None:
+        message.operator_name = payload.operator_name
+    if preserve_existing_recipients:
+        for recipient in message.recipients:
+            recipient.status = "대기"
+            recipient.provider_message_id = None
+            recipient.fail_code = None
+            recipient.fail_reason = None
+            recipient.sent_at = None
+    else:
+        replace_sms_message_recipients(message, final_recipients)
+    db.flush()
+    add_audit_log(
+        db,
+        action_type="문자 예약 수정",
+        target_type="sms_message",
+        target_id=message.id,
+        before_data=before,
+        after_data=model_snapshot(message, ["title", "content", "content_type", "message_type", "target_count", "status", "scheduled_at"]),
+        actor_name=payload.operator_name,
+    )
+    db.commit()
+    return get_sms_schedule_or_404(db, message.id)
+
+
+def cancel_sms_schedule(
+    db: Session, message_id: int, provider: NaverSensSmsProvider | None = None, operator_name: str | None = None
+) -> models.SmsMessage:
+    message = sync_sms_message_runtime_state(db, message_id, provider)
+    message = get_sms_schedule_or_404(db, message.id)
+    if message.status != "예약":
+        fail(400, "sms_schedule_not_cancelable", "발송 전 예약만 삭제할 수 있습니다.")
+    if not message.provider_request_id:
+        fail(400, "sms_schedule_invalid_state", "예약 요청 정보를 다시 확인해 주세요.")
+
+    provider = provider or get_sms_provider()
+    try:
+        provider.cancel_reservation(reserve_id=message.provider_request_id)
+    except Exception as exc:
+        fail(502, "sms_schedule_cancel_failed", str(exc) or "문자 예약 삭제에 실패했습니다.")
+    before = model_snapshot(message, ["status", "canceled_at"])
+    message.status = "예약취소"
+    message.canceled_at = datetime.now(timezone.utc)
+    message.sync_completed_at = message.sync_completed_at or message.canceled_at
+    db.flush()
+    add_audit_log(
+        db,
+        action_type="문자 예약 취소",
+        target_type="sms_message",
+        target_id=message.id,
+        before_data=before,
+        after_data=model_snapshot(message, ["status", "canceled_at"]),
+        actor_name=operator_name or message.operator_name,
+    )
+    db.commit()
+    return get_sms_schedule_or_404(db, message.id)
+
+
+def query_sms_schedules(db: Session, page: int, size: int) -> tuple[list[models.SmsMessage], int]:
+    pending_ids = db.scalars(
+        select(models.SmsMessage.id).where(
+            models.SmsMessage.scheduled_at.is_not(None),
+            models.SmsMessage.status == "예약",
+            models.SmsMessage.provider_request_id.is_not(None),
+        )
+    ).all()
+    for message_id in pending_ids:
+        try:
+            sync_sms_schedule_status(db, message_id)
+        except Exception:
+            db.rollback()
+
+    stmt = select(models.SmsMessage).where(
+        models.SmsMessage.scheduled_at.is_not(None),
+        models.SmsMessage.status.in_(SMS_SCHEDULE_LIST_STATUSES),
+    )
+    total = db.scalar(select(func.count()).select_from(stmt.order_by(None).subquery())) or 0
+    items = db.scalars(
+        stmt.order_by(models.SmsMessage.scheduled_at.desc(), models.SmsMessage.id.desc())
+        .offset((page - 1) * size)
+        .limit(size)
+    ).all()
+    return list(items), total
+
+
+def query_sms_history(db: Session, page: int, size: int) -> tuple[list[models.SmsMessage], int]:
+    pending_ids = db.scalars(
+        select(models.SmsMessage.id).where(
+            models.SmsMessage.provider_request_id.is_not(None),
+            models.SmsMessage.status.in_(SMS_SCHEDULE_SYNC_STATUSES),
+        )
+    ).all()
+    for message_id in pending_ids:
+        try:
+            sync_sms_message_runtime_state(db, message_id)
+        except Exception:
+            db.rollback()
+
+    stmt = select(models.SmsMessage).where(models.SmsMessage.status.not_in(SMS_HISTORY_EXCLUDED_STATUSES))
+    total = db.scalar(select(func.count()).select_from(stmt.order_by(None).subquery())) or 0
+    items = db.scalars(
+        stmt.order_by(models.SmsMessage.created_at.desc(), models.SmsMessage.id.desc())
+        .offset((page - 1) * size)
+        .limit(size)
+    ).all()
     return list(items), total
 
 
@@ -1930,9 +2513,9 @@ def query_sms_message_recipients(
     db: Session, message_id: int, keyword: str | None, page: int, size: int
 ) -> tuple[models.SmsMessage, list[models.SmsMessageRecipient], int]:
     message = get_sms_message_or_404(db, message_id)
-    if message.status == "발송중" and message.provider_request_id:
+    if message.provider_request_id and message.status in SMS_SCHEDULE_SYNC_STATUSES:
         try:
-            message = sync_sms_message_delivery(db, message_id)
+            message = sync_sms_message_runtime_state(db, message_id)
         except Exception:
             db.rollback()
             message = get_sms_message_or_404(db, message_id)

@@ -8,7 +8,9 @@ type SalesSummaryRange = "하루" | "1주" | "2주" | "3주" | "4주" | "한달"
 type SalesSummaryModalKey = "payment" | "product" | "member" | "day" | "totalAmount" | "totalCount";
 type DashboardMembershipModalKey = "expiring" | "lowCount";
 type SmsContentType = "COMM" | "AD";
+type SmsDispatchMode = "immediate" | "scheduled";
 type SmsSendStep = "target" | "content" | "review" | "done";
+type SmsPreviewMode = "live" | "scheduleSnapshot";
 type SmsMonthlyBillingStatus = "idle" | "loading" | "ready" | "error";
 
 interface ListResult<T> {
@@ -205,10 +207,13 @@ interface SmsMessage {
   provider_name?: string | null;
   provider_request_id?: string | null;
   target_summary?: Record<string, unknown> | null;
+  scheduled_at?: string | null;
   sent_at?: string | null;
+  canceled_at?: string | null;
   sync_completed_at?: string | null;
   operator_name?: string | null;
   created_at: string;
+  updated_at?: string | null;
 }
 
 interface SmsMessageRecipient {
@@ -218,6 +223,8 @@ interface SmsMessageRecipient {
   member_name?: string | null;
   recipient_name?: string | null;
   phone: string;
+  sms_agree: boolean;
+  source_labels: string[];
   status: string;
   provider_message_id?: string | null;
   fail_code?: string | null;
@@ -306,6 +313,8 @@ interface SmsComposeForm {
   birthday_days: string;
   group_ids: string[];
   content_type: SmsContentType;
+  send_mode: SmsDispatchMode;
+  scheduled_at: string;
   template_id: string;
   title: string;
   content: string;
@@ -432,6 +441,8 @@ const emptySmsComposeForm: SmsComposeForm = {
   birthday_days: "0",
   group_ids: [],
   content_type: "COMM",
+  send_mode: "immediate",
+  scheduled_at: "",
   template_id: "",
   title: "",
   content: ""
@@ -507,6 +518,145 @@ function selectedValues(event: ChangeEvent<HTMLSelectElement>) {
 function smsTargetSummaryText(targetSummary: Record<string, unknown> | null | undefined) {
   const labels = Array.isArray(targetSummary?.labels) ? targetSummary?.labels : [];
   return labels.length > 0 ? labels.join(", ") : "-";
+}
+
+function smsTargetSummaryNumber(targetSummary: Record<string, unknown> | null | undefined, key: string, fallback = 0) {
+  const value = Number(targetSummary?.[key]);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function smsTargetSummaryBoolean(targetSummary: Record<string, unknown> | null | undefined, key: string) {
+  return targetSummary?.[key] === true;
+}
+
+function smsTargetSummaryStringArray(targetSummary: Record<string, unknown> | null | undefined, key: string) {
+  const value = targetSummary?.[key];
+  return Array.isArray(value) ? value.map(String) : [];
+}
+
+function formatDateTimeLocalInput(value: string | null | undefined) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}T${pad2(date.getHours())}:${pad2(
+    date.getMinutes()
+  )}`;
+}
+
+function localDateTimeInputToIso(value: string) {
+  const [datePart, timePart] = value.split("T");
+  if (!datePart || !timePart) return "";
+  const [year, month, day] = datePart.split("-").map(Number);
+  const [hour, minute] = timePart.split(":").map(Number);
+  if (!year || !month || !day || Number.isNaN(hour) || Number.isNaN(minute)) return "";
+  return new Date(year, month - 1, day, hour, minute, 0, 0).toISOString();
+}
+
+function smsExcludedKeysFromSummary(targetSummary: Record<string, unknown> | null | undefined) {
+  const memberKeys = smsTargetSummaryStringArray(targetSummary, "excluded_member_ids")
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value))
+    .map((value) => `member:${value}`);
+  const phoneKeys = smsTargetSummaryStringArray(targetSummary, "excluded_phones").map((value) => `phone:${digitsOnly(value)}`);
+  return Array.from(new Set([...memberKeys, ...phoneKeys]));
+}
+
+function smsExcludedKeysToPayload(keys: string[]) {
+  const excludedMemberIds = new Set<number>();
+  const excludedPhones = new Set<string>();
+  keys.forEach((key) => {
+    if (key.startsWith("member:")) {
+      const memberId = Number(key.slice(7));
+      if (Number.isFinite(memberId)) {
+        excludedMemberIds.add(memberId);
+      }
+      return;
+    }
+    if (key.startsWith("phone:")) {
+      const phone = digitsOnly(key.slice(6));
+      if (phone) {
+        excludedPhones.add(phone);
+      }
+    }
+  });
+  return {
+    excluded_member_ids: Array.from(excludedMemberIds),
+    excluded_phones: Array.from(excludedPhones)
+  };
+}
+
+function smsTargetConfigSignature(form: SmsComposeForm, excludedKeys: string[]) {
+  return JSON.stringify({
+    include_all_members: form.include_all_members,
+    include_expiring_memberships: form.include_expiring_memberships,
+    expiring_days: Math.max(1, Number(form.expiring_days || 7)),
+    include_low_remaining_memberships: form.include_low_remaining_memberships,
+    low_remaining_count: Math.max(0, Number(form.low_remaining_count || 3)),
+    include_birthdays: form.include_birthdays,
+    birthday_days: Math.max(0, Number(form.birthday_days || 0)),
+    group_ids: [...form.group_ids].map(Number).sort((left, right) => left - right),
+    content_type: form.content_type,
+    ...smsExcludedKeysToPayload(excludedKeys)
+  });
+}
+
+function smsTargetSummarySignature(message: SmsMessage | null) {
+  if (!message) return "";
+  const summary = message.target_summary || null;
+  return JSON.stringify({
+    include_all_members: smsTargetSummaryBoolean(summary, "include_all_members"),
+    include_expiring_memberships: smsTargetSummaryBoolean(summary, "include_expiring_memberships"),
+    expiring_days: smsTargetSummaryNumber(summary, "expiring_days", 7),
+    include_low_remaining_memberships: smsTargetSummaryBoolean(summary, "include_low_remaining_memberships"),
+    low_remaining_count: smsTargetSummaryNumber(summary, "low_remaining_count", 3),
+    include_birthdays: smsTargetSummaryBoolean(summary, "include_birthdays"),
+    birthday_days: smsTargetSummaryNumber(summary, "birthday_days", 0),
+    group_ids: smsTargetSummaryStringArray(summary, "group_ids").map(Number).sort((left, right) => left - right),
+    content_type: message.content_type,
+    ...smsExcludedKeysToPayload(smsExcludedKeysFromSummary(summary))
+  });
+}
+
+function smsScheduleToComposeForm(message: SmsMessage): SmsComposeForm {
+  const summary = message.target_summary || null;
+  return {
+    include_all_members: smsTargetSummaryBoolean(summary, "include_all_members"),
+    include_expiring_memberships: smsTargetSummaryBoolean(summary, "include_expiring_memberships"),
+    expiring_days: String(smsTargetSummaryNumber(summary, "expiring_days", 7)),
+    include_low_remaining_memberships: smsTargetSummaryBoolean(summary, "include_low_remaining_memberships"),
+    low_remaining_count: String(smsTargetSummaryNumber(summary, "low_remaining_count", 3)),
+    include_birthdays: smsTargetSummaryBoolean(summary, "include_birthdays"),
+    birthday_days: String(smsTargetSummaryNumber(summary, "birthday_days", 0)),
+    group_ids: smsTargetSummaryStringArray(summary, "group_ids"),
+    content_type: message.content_type,
+    send_mode: "scheduled",
+    scheduled_at: formatDateTimeLocalInput(message.scheduled_at),
+    template_id: message.template_id ? String(message.template_id) : "",
+    title: message.title || "",
+    content: message.content
+  };
+}
+
+function smsPreviewFromSchedule(message: SmsMessage, recipients: SmsMessageRecipient[]): SmsPreviewResult {
+  const targetSummary = message.target_summary || null;
+  const blockedCount = smsTargetSummaryNumber(targetSummary, "blocked_count", 0);
+  const excludedCount = smsTargetSummaryNumber(targetSummary, "excluded_count", 0);
+  return {
+    summary: {
+      total_candidates: recipients.length + blockedCount + excludedCount,
+      eligible_count: recipients.length,
+      blocked_count: blockedCount,
+      excluded_count: 0
+    },
+    eligible_recipients: recipients.map((item) => ({
+      member_id: item.member_id,
+      recipient_name: item.recipient_name || item.member_name || "-",
+      phone: item.phone,
+      sms_agree: item.sms_agree,
+      source_labels: item.source_labels || []
+    })),
+    blocked_recipients: []
+  };
 }
 
 function formatDateTime(value: string | null | undefined) {
@@ -767,6 +917,7 @@ function App() {
   const [smsGroups, setSmsGroups] = useState<SmsGroup[]>([]);
   const [smsTemplates, setSmsTemplates] = useState<SmsTemplate[]>([]);
   const [smsHistory, setSmsHistory] = useState<SmsMessage[]>([]);
+  const [smsSchedules, setSmsSchedules] = useState<SmsMessage[]>([]);
   const [smsMemberOptions, setSmsMemberOptions] = useState<Member[]>([]);
   const [smsComposeForm, setSmsComposeForm] = useState<SmsComposeForm>(emptySmsComposeForm);
   const [smsSendStep, setSmsSendStep] = useState<SmsSendStep>("target");
@@ -774,9 +925,13 @@ function App() {
   const [smsLastSentDetailItems, setSmsLastSentDetailItems] = useState<SmsMessageRecipient[]>([]);
   const [smsLastSentDetailLoading, setSmsLastSentDetailLoading] = useState(false);
   const [smsPreview, setSmsPreview] = useState<SmsPreviewResult | null>(null);
+  const [smsPreviewMode, setSmsPreviewMode] = useState<SmsPreviewMode | null>(null);
   const [smsPreviewModalOpen, setSmsPreviewModalOpen] = useState(false);
   const [smsPreviewKeyword, setSmsPreviewKeyword] = useState("");
   const [smsExcludedRecipients, setSmsExcludedRecipients] = useState<string[]>([]);
+  const [smsEditingSchedule, setSmsEditingSchedule] = useState<SmsMessage | null>(null);
+  const [smsEditingScheduleRecipients, setSmsEditingScheduleRecipients] = useState<SmsMessageRecipient[]>([]);
+  const [smsScheduleModalOpen, setSmsScheduleModalOpen] = useState(false);
   const [smsGroupModalOpen, setSmsGroupModalOpen] = useState(false);
   const [smsGroupForm, setSmsGroupForm] = useState<SmsGroupForm>(emptySmsGroupForm);
   const [smsEditingGroup, setSmsEditingGroup] = useState<SmsGroup | null>(null);
@@ -966,6 +1121,20 @@ function App() {
       return text.includes(keyword) || phoneMatch;
     });
   }, [smsHistoryDetailItems, smsHistoryDetailKeyword]);
+  const smsEditingScheduleSignature = useMemo(() => smsTargetSummarySignature(smsEditingSchedule), [smsEditingSchedule]);
+  const smsCurrentTargetSignature = useMemo(
+    () => smsTargetConfigSignature(smsComposeForm, smsExcludedRecipients),
+    [smsComposeForm, smsExcludedRecipients]
+  );
+  const smsCanUseScheduleSnapshot = useMemo(
+    () =>
+      Boolean(
+        smsEditingSchedule &&
+          smsEditingScheduleRecipients.length > 0 &&
+          smsEditingScheduleSignature === smsCurrentTargetSignature
+      ),
+    [smsCurrentTargetSignature, smsEditingSchedule, smsEditingScheduleRecipients, smsEditingScheduleSignature]
+  );
 
   async function refreshDashboard() {
     const params = new URLSearchParams({
@@ -1153,12 +1322,22 @@ function App() {
     setSmsHistory(result.items);
   }
 
+  async function refreshSmsSchedules() {
+    const result = await api<ListResult<SmsMessage>>("/sms/schedules?size=50");
+    setSmsSchedules(result.items);
+    setSmsEditingSchedule((current) => {
+      if (!current) return current;
+      return result.items.find((item) => item.id === current.id) || current;
+    });
+  }
+
   async function fetchSmsMessageRecipients(messageId: number) {
     return api<{ message: SmsMessage; items: SmsMessageRecipient[]; total: number }>(`/sms/${messageId}/recipients?size=500`);
   }
 
   function applySmsMessageDetailResult(result: { message: SmsMessage; items: SmsMessageRecipient[] }) {
     setSmsHistory((current) => current.map((item) => (item.id === result.message.id ? result.message : item)));
+    setSmsSchedules((current) => current.map((item) => (item.id === result.message.id ? result.message : item)));
   }
 
   async function openSmsHistoryModal() {
@@ -1202,7 +1381,7 @@ function App() {
   }
 
   async function refreshSmsData() {
-    await Promise.all([refreshSmsGroups(), refreshSmsTemplates(), refreshSmsHistory(), refreshSmsMemberOptions()]);
+    await Promise.all([refreshSmsGroups(), refreshSmsTemplates(), refreshSmsHistory(), refreshSmsSchedules(), refreshSmsMemberOptions()]);
   }
 
   async function loadSmsMonthlyBilling(month = smsMonthlyBillingMonth) {
@@ -1245,12 +1424,53 @@ function App() {
       group_ids: []
     }));
     setSmsPreview(null);
+    setSmsPreviewMode(null);
     setSmsPreviewModalOpen(false);
     setSmsPreviewKeyword("");
     setSmsExcludedRecipients([]);
+    setSmsEditingSchedule(null);
+    setSmsEditingScheduleRecipients([]);
     setSmsLastSentMessage(null);
     setSmsLastSentDetailItems([]);
     await refreshSmsData();
+  }
+
+  async function openSmsScheduleModal() {
+    setSmsScheduleModalOpen(true);
+    try {
+      await refreshSmsSchedules();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "문자 예약 목록을 불러오지 못했습니다.");
+    }
+  }
+
+  function closeSmsScheduleEditor() {
+    setSmsEditingSchedule(null);
+    setSmsEditingScheduleRecipients([]);
+  }
+
+  async function openSmsScheduleEdit(message: SmsMessage) {
+    setLoading(true);
+    try {
+      const result = await fetchSmsMessageRecipients(message.id);
+      setSmsEditingSchedule(result.message);
+      setSmsEditingScheduleRecipients(result.items);
+      setSmsComposeForm(smsScheduleToComposeForm(result.message));
+      setSmsExcludedRecipients(smsExcludedKeysFromSummary(result.message.target_summary));
+      setSmsPreview(null);
+      setSmsPreviewMode(null);
+      setSmsPreviewKeyword("");
+      setSmsPreviewModalOpen(false);
+      setSmsLastSentMessage(null);
+      setSmsLastSentDetailItems([]);
+      setSmsSendStep("target");
+      setSmsScheduleModalOpen(false);
+      setActiveTab("sms");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "문자 예약 정보를 불러오지 못했습니다.");
+    } finally {
+      setLoading(false);
+    }
   }
 
   function openSmsGroupCreateModal() {
@@ -1367,6 +1587,24 @@ function App() {
     };
   }
 
+  function buildSmsRequestPayload(form: SmsComposeForm, excludedKeys: string[]) {
+    const payload = {
+      ...buildSmsTargetPayload(form),
+      content_type: form.content_type,
+      template_id: form.template_id ? Number(form.template_id) : null,
+      title: form.title || null,
+      content: form.content,
+      ...smsExcludedKeysToPayload(excludedKeys)
+    };
+    if (form.send_mode === "scheduled") {
+      return {
+        ...payload,
+        scheduled_at: localDateTimeInputToIso(form.scheduled_at)
+      };
+    }
+    return payload;
+  }
+
   function hasSmsTargetSelection(form: SmsComposeForm) {
     return (
       form.include_all_members ||
@@ -1397,9 +1635,12 @@ function App() {
   function resetSmsSendFlow() {
     setSmsComposeForm(emptySmsComposeForm);
     setSmsPreview(null);
+    setSmsPreviewMode(null);
     setSmsPreviewModalOpen(false);
     setSmsPreviewKeyword("");
     setSmsExcludedRecipients([]);
+    setSmsEditingSchedule(null);
+    setSmsEditingScheduleRecipients([]);
     setSmsLastSentMessage(null);
     setSmsLastSentDetailItems([]);
     setSmsLastSentDetailLoading(false);
@@ -1414,16 +1655,18 @@ function App() {
     }
     setLoading(true);
     try {
-      const result = await api<SmsPreviewResult>("/sms/recipients/preview", {
-        method: "POST",
-        body: JSON.stringify({
-          ...buildSmsTargetPayload(smsComposeForm),
-          content_type: smsComposeForm.content_type
-        })
-      });
+      const result = smsCanUseScheduleSnapshot && smsEditingSchedule
+        ? smsPreviewFromSchedule(smsEditingSchedule, smsEditingScheduleRecipients)
+        : await api<SmsPreviewResult>("/sms/recipients/preview", {
+            method: "POST",
+            body: JSON.stringify({
+              ...buildSmsTargetPayload(smsComposeForm),
+              content_type: smsComposeForm.content_type
+            })
+          });
       setSmsPreview(result);
+      setSmsPreviewMode(smsCanUseScheduleSnapshot ? "scheduleSnapshot" : "live");
       setSmsPreviewKeyword("");
-      setSmsExcludedRecipients([]);
       setSmsPreviewModalOpen(true);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "포함 회원을 불러오지 못했습니다.");
@@ -1443,18 +1686,25 @@ function App() {
       setSmsSendStep("content");
       return;
     }
+    if (smsComposeForm.send_mode === "scheduled" && !smsComposeForm.scheduled_at) {
+      setNotice("예약 발송 시각을 입력해 주세요.");
+      setSmsSendStep("content");
+      return;
+    }
     setLoading(true);
     try {
-      const result = await api<SmsPreviewResult>("/sms/recipients/preview", {
-        method: "POST",
-        body: JSON.stringify({
-          ...buildSmsTargetPayload(smsComposeForm),
-          content_type: smsComposeForm.content_type
-        })
-      });
+      const result = smsCanUseScheduleSnapshot && smsEditingSchedule
+        ? smsPreviewFromSchedule(smsEditingSchedule, smsEditingScheduleRecipients)
+        : await api<SmsPreviewResult>("/sms/recipients/preview", {
+            method: "POST",
+            body: JSON.stringify({
+              ...buildSmsTargetPayload(smsComposeForm),
+              content_type: smsComposeForm.content_type
+            })
+          });
       setSmsPreview(result);
+      setSmsPreviewMode(smsCanUseScheduleSnapshot ? "scheduleSnapshot" : "live");
       setSmsPreviewKeyword("");
-      setSmsExcludedRecipients([]);
       setSmsPreviewModalOpen(false);
       setSmsLastSentMessage(null);
       setSmsLastSentDetailItems([]);
@@ -1482,6 +1732,11 @@ function App() {
       setSmsSendStep("content");
       return;
     }
+    if (smsComposeForm.send_mode === "scheduled" && !smsComposeForm.scheduled_at) {
+      setNotice("예약 발송 시각을 입력해 주세요.");
+      setSmsSendStep("content");
+      return;
+    }
     if (smsPreview) {
       const activeEligibleCount =
         smsPreview.eligible_recipients.length -
@@ -1492,47 +1747,71 @@ function App() {
         return;
       }
     }
-    if (!window.confirm("현재 대상 기준으로 문자를 발송할까요?")) return;
+    const confirmMessage =
+      smsComposeForm.send_mode === "scheduled"
+        ? smsEditingSchedule
+          ? "현재 대상 기준으로 예약을 수정할까요?"
+          : "현재 대상 기준으로 예약을 등록할까요?"
+        : "현재 대상 기준으로 문자를 발송할까요?";
+    if (!window.confirm(confirmMessage)) return;
     setLoading(true);
     try {
-      const preview = smsPreview || (await api<SmsPreviewResult>("/sms/recipients/preview", {
-        method: "POST",
-        body: JSON.stringify({
-          ...buildSmsTargetPayload(smsComposeForm),
-          content_type: smsComposeForm.content_type
-        })
-      }));
-      const excludedMemberIds = preview.eligible_recipients
-        .filter((item) => smsExcludedRecipients.includes(smsRecipientKey(item)) && item.member_id)
-        .map((item) => Number(item.member_id));
-      const excludedPhones = preview.eligible_recipients
-        .filter((item) => smsExcludedRecipients.includes(smsRecipientKey(item)))
-        .filter((item) => !item.member_id)
-        .map((item) => item.phone);
-      const message = await api<SmsMessage>("/sms/send", {
-        method: "POST",
-        body: JSON.stringify({
-          ...buildSmsTargetPayload(smsComposeForm),
-          content_type: smsComposeForm.content_type,
-          template_id: smsComposeForm.template_id ? Number(smsComposeForm.template_id) : null,
-          title: smsComposeForm.title || null,
-          content: smsComposeForm.content,
-          excluded_member_ids: excludedMemberIds,
-          excluded_phones: excludedPhones
-        })
+      const preview =
+        smsPreview ||
+        (smsCanUseScheduleSnapshot && smsEditingSchedule
+          ? smsPreviewFromSchedule(smsEditingSchedule, smsEditingScheduleRecipients)
+          : await api<SmsPreviewResult>("/sms/recipients/preview", {
+              method: "POST",
+              body: JSON.stringify({
+                ...buildSmsTargetPayload(smsComposeForm),
+                content_type: smsComposeForm.content_type
+              })
+            }));
+      const activeEligibleCount =
+        preview.eligible_recipients.length -
+        preview.eligible_recipients.filter((item) => smsExcludedRecipients.includes(smsRecipientKey(item))).length;
+      if (activeEligibleCount <= 0) {
+        setNotice("최종 발송 대상이 없습니다.");
+        setSmsSendStep("review");
+        return;
+      }
+
+      const isScheduled = smsComposeForm.send_mode === "scheduled";
+      const path = isScheduled
+        ? smsEditingSchedule
+          ? `/sms/schedules/${smsEditingSchedule.id}`
+          : "/sms/schedules"
+        : "/sms/send";
+      const method = isScheduled ? (smsEditingSchedule ? "PUT" : "POST") : "POST";
+      const message = await api<SmsMessage>(path, {
+        method,
+        body: JSON.stringify(buildSmsRequestPayload(smsComposeForm, smsExcludedRecipients))
       });
-      setNotice(message.status === "실패" ? "문자 발송 요청이 실패 이력으로 저장되었습니다." : "문자 발송 요청을 등록했습니다.");
+      if (isScheduled) {
+        setNotice(
+          message.status === "실패"
+            ? "문자 예약 요청이 실패 이력으로 저장되었습니다."
+            : smsEditingSchedule
+              ? "문자 예약을 수정했습니다."
+              : "문자 예약을 등록했습니다."
+        );
+      } else {
+        setNotice(message.status === "실패" ? "문자 발송 요청이 실패 이력으로 저장되었습니다." : "문자 발송 요청을 등록했습니다.");
+      }
       setSmsLastSentMessage(message);
       setSmsLastSentDetailItems([]);
       setSmsPreview(null);
+      setSmsPreviewMode(null);
       setSmsPreviewModalOpen(false);
       setSmsPreviewKeyword("");
       setSmsExcludedRecipients([]);
+      setSmsEditingSchedule(null);
+      setSmsEditingScheduleRecipients([]);
       setSmsSendStep("done");
-      await refreshSmsHistory();
+      await Promise.all([refreshSmsHistory(), refreshSmsSchedules()]);
       void refreshSmsLastSentResult(message.id, false);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "문자 발송에 실패했습니다.");
+      setNotice(error instanceof Error ? error.message : smsComposeForm.send_mode === "scheduled" ? "문자 예약에 실패했습니다." : "문자 발송에 실패했습니다.");
     } finally {
       setLoading(false);
     }
@@ -1590,6 +1869,23 @@ function App() {
       await refreshSmsGroups();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "문자 그룹 삭제에 실패했습니다.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleSmsScheduleDelete(message: SmsMessage) {
+    if (!window.confirm("선택한 문자 예약을 삭제할까요?")) return;
+    setLoading(true);
+    try {
+      await api<SmsMessage>(`/sms/schedules/${message.id}`, { method: "DELETE" });
+      setNotice("문자 예약을 삭제했습니다.");
+      if (smsEditingSchedule?.id === message.id) {
+        closeSmsScheduleEditor();
+      }
+      await Promise.all([refreshSmsSchedules(), refreshSmsHistory()]);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "문자 예약 삭제에 실패했습니다.");
     } finally {
       setLoading(false);
     }
@@ -2443,6 +2739,14 @@ function App() {
   }, [smsHistory, smsHistoryModalOpen]);
 
   useEffect(() => {
+    if (!smsScheduleModalOpen || !smsSchedules.some((message) => message.status === "예약")) return;
+    const timer = window.setInterval(() => {
+      void refreshSmsSchedules().catch(() => undefined);
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [smsScheduleModalOpen, smsSchedules]);
+
+  useEffect(() => {
     if (smsSendStep !== "done" || !smsLastSentMessage || smsLastSentMessage.status !== "발송중") return;
     const timer = window.setInterval(() => {
       void refreshSmsLastSentResult(smsLastSentMessage.id, false);
@@ -2452,9 +2756,9 @@ function App() {
 
   useEffect(() => {
     setSmsPreview(null);
+    setSmsPreviewMode(null);
     setSmsPreviewModalOpen(false);
     setSmsPreviewKeyword("");
-    setSmsExcludedRecipients([]);
     setSmsLastSentMessage(null);
     setSmsLastSentDetailItems([]);
     setSmsLastSentDetailLoading(false);
@@ -2468,7 +2772,8 @@ function App() {
     smsComposeForm.include_birthdays,
     smsComposeForm.birthday_days,
     smsComposeForm.group_ids,
-    smsComposeForm.content_type
+    smsComposeForm.content_type,
+    smsComposeForm.send_mode
   ]);
 
   useEffect(() => {
@@ -2661,6 +2966,7 @@ function App() {
         {SMS_FEATURE_VISIBLE && smsDeleteGroupTarget && renderSmsGroupDeleteModal()}
         {SMS_FEATURE_VISIBLE && smsTemplateModalOpen && renderSmsTemplateModal()}
         {SMS_FEATURE_VISIBLE && smsMonthlyBillingModalOpen && renderSmsMonthlyBillingModal()}
+        {SMS_FEATURE_VISIBLE && smsScheduleModalOpen && renderSmsScheduleModal()}
         {SMS_FEATURE_VISIBLE && smsHistoryModalOpen && renderSmsHistoryModal()}
         {SMS_FEATURE_VISIBLE && smsHistoryDetailTarget && renderSmsHistoryDetailModal()}
         {SMS_FEATURE_VISIBLE && smsHistoryMessageTarget && renderSmsHistoryMessageModal()}
@@ -4509,9 +4815,95 @@ function App() {
     );
   }
 
+  function renderSmsScheduleModal() {
+    return (
+      <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="sms-schedule-title">
+        <section className="form-panel modal-panel summary-modal-panel">
+          <div className="modal-title-row">
+            <div>
+              <h2 id="sms-schedule-title">예약 발송 관리</h2>
+              <p className="note-meta">예약중 또는 취소된 예약을 확인합니다. 발송 완료된 예약은 발송 이력으로 이동합니다.</p>
+            </div>
+            <div className="table-actions">
+              <button type="button" className="secondary" onClick={() => void refreshSmsSchedules()}>
+                새로고침
+              </button>
+              <button type="button" className="secondary" onClick={() => setSmsScheduleModalOpen(false)}>
+                닫기
+              </button>
+            </div>
+          </div>
+          {smsSchedules.length === 0 ? (
+            <p className="empty">등록된 문자 예약이 없습니다.</p>
+          ) : (
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>예약시각</th>
+                    <th>등록시각</th>
+                    <th>유형</th>
+                    <th>대상</th>
+                    <th>예약수</th>
+                    <th>상태</th>
+                    <th>관리</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {smsSchedules.map((message) => (
+                    <tr key={message.id}>
+                      <td>{formatDateTime(message.scheduled_at)}</td>
+                      <td>{formatDateTime(message.created_at)}</td>
+                      <td>
+                        {message.content_type} / {message.message_type}
+                      </td>
+                      <td className="memo-cell">{smsTargetSummaryText(message.target_summary)}</td>
+                      <td>{message.target_count}명</td>
+                      <td>
+                        <span className={`status-chip ${message.status === "예약취소" ? "inactive" : "active"}`}>{message.status}</span>
+                      </td>
+                      <td>
+                        <div className="table-actions">
+                          <button type="button" className="secondary" onClick={() => setSmsHistoryMessageTarget(message)}>
+                            메시지
+                          </button>
+                          <button type="button" className="secondary" onClick={() => void openSmsHistoryDetail(message)}>
+                            대상
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary"
+                            onClick={() => void openSmsScheduleEdit(message)}
+                            disabled={message.status !== "예약"}
+                          >
+                            수정
+                          </button>
+                          <button
+                            type="button"
+                            className="danger"
+                            onClick={() => void handleSmsScheduleDelete(message)}
+                            disabled={message.status !== "예약"}
+                          >
+                            삭제
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      </div>
+    );
+  }
+
   function renderSms() {
     const smsTargetReady = hasSmsTargetSelection(smsComposeForm);
-    const smsContentReady = smsComposeForm.content.trim().length > 0;
+    const smsContentReady =
+      smsComposeForm.content.trim().length > 0 &&
+      (smsComposeForm.send_mode === "immediate" || Boolean(smsComposeForm.scheduled_at));
     const currentStepIndex = SMS_SEND_STEPS.findIndex((step) => step.key === smsSendStep);
     const excludedCount =
       smsPreview?.eligible_recipients.filter((item) => smsExcludedRecipients.includes(smsRecipientKey(item))).length || 0;
@@ -4519,6 +4911,11 @@ function App() {
     const selectedGroupNames = smsGroups
       .filter((group) => smsComposeForm.group_ids.includes(String(group.id)))
       .map((group) => group.name);
+    const isEditingSchedule = Boolean(smsEditingSchedule);
+    const isScheduledMode = smsComposeForm.send_mode === "scheduled";
+    const smsReviewActionLabel = isScheduledMode ? (isEditingSchedule ? "예약 수정" : "예약 등록") : "문자 발송";
+    const smsDoneActionLabel =
+      smsLastSentMessage?.status === "예약" || smsLastSentMessage?.status === "예약취소" ? "예약 목록 보기" : "발송 이력 보기";
 
     function smsStepDisabled(step: SmsSendStep) {
       if (step === "content") return !smsTargetReady;
@@ -4547,6 +4944,9 @@ function App() {
           </button>
           <button type="button" className="secondary" onClick={openSmsTemplateCreateModal}>
             템플릿 등록
+          </button>
+          <button type="button" className="secondary" onClick={() => void openSmsScheduleModal()}>
+            예약 발송 관리 {smsSchedules.length}건
           </button>
           <button type="button" className="secondary" onClick={openSmsMonthlyBillingModal}>
             월별 청구금액
@@ -4585,7 +4985,11 @@ function App() {
               <div className="modal-title-row">
                 <div>
                   <h2>받는 사람</h2>
-                  <p className="note-meta">전체 회원, 만료 예정, 그룹을 합쳐서 중복 없이 발송합니다.</p>
+                  <p className="note-meta">
+                    {isEditingSchedule
+                      ? "예약 수정 중입니다. 대상 조건을 바꾸지 않으면 예약 당시 확정된 대상이 유지됩니다."
+                      : "전체 회원, 만료 예정, 그룹을 합쳐서 중복 없이 발송합니다."}
+                  </p>
                 </div>
                 <button type="button" className="secondary" onClick={() => void refreshSmsDataAndClearTarget()}>
                   새로고침
@@ -4735,7 +5139,10 @@ function App() {
               <div className="modal-title-row">
                 <div>
                   <h2>내용 입력</h2>
-                  <p className="note-meta">광고용은 문자 수신 동의 회원만 발송 대상에 포함됩니다.</p>
+                  <p className="note-meta">
+                    광고용은 문자 수신 동의 회원만 발송 대상에 포함됩니다.
+                    {isEditingSchedule && " 예약 시각과 내용은 여기서 함께 수정합니다."}
+                  </p>
                 </div>
               </div>
               <div className="form-grid">
@@ -4752,6 +5159,18 @@ function App() {
                   </select>
                 </label>
                 <label>
+                  발송 방식
+                  <select
+                    value={smsComposeForm.send_mode}
+                    onChange={(event) =>
+                      setSmsComposeForm({ ...smsComposeForm, send_mode: event.target.value as SmsDispatchMode })
+                    }
+                  >
+                    <option value="immediate">즉시 발송</option>
+                    <option value="scheduled">예약 발송</option>
+                  </select>
+                </label>
+                <label>
                   템플릿
                   <select value={smsComposeForm.template_id} onChange={(event) => applySmsTemplate(event.target.value)}>
                     <option value="">템플릿 선택 안함</option>
@@ -4765,6 +5184,16 @@ function App() {
                   </select>
                 </label>
               </div>
+              {smsComposeForm.send_mode === "scheduled" && (
+                <label>
+                  예약 발송 시각
+                  <input
+                    type="datetime-local"
+                    value={smsComposeForm.scheduled_at}
+                    onChange={(event) => setSmsComposeForm({ ...smsComposeForm, scheduled_at: event.target.value })}
+                  />
+                </label>
+              )}
               <label>
                 제목
                 <input
@@ -4808,10 +5237,13 @@ function App() {
                     차단 {smsPreview?.summary.blocked_count || 0}명 · 제외 {excludedCount}명
                   </p>
                 </div>
-                {smsPreview && <strong>{activeEligibleCount}명 최종 발송</strong>}
+                {smsPreview && <strong>{activeEligibleCount}명 최종 {isScheduledMode ? "예약" : "발송"}</strong>}
               </div>
               {smsPreview ? (
                 <div className="summary-detail-stack">
+                  {smsPreviewMode === "scheduleSnapshot" && (
+                    <p className="note-meta">대상 조건이 바뀌지 않아 예약 당시 확정된 수신자 snapshot을 그대로 보여주고 있습니다.</p>
+                  )}
                   <div className="search-row">
                     <input
                       className="large-input"
@@ -4902,7 +5334,7 @@ function App() {
                 대상 다시 확인
               </button>
               <button type="button" onClick={() => void handleSmsSend()} disabled={!smsPreview || activeEligibleCount <= 0}>
-                문자 발송
+                {smsReviewActionLabel}
               </button>
             </aside>
           </div>
@@ -4914,7 +5346,11 @@ function App() {
               <div className="modal-title-row">
                 <div>
                   <h2>결과</h2>
-                  <p className="note-meta">상태는 자동으로 다시 확인하며, 아래에서 보낸 메시지와 수신자별 결과를 바로 볼 수 있습니다.</p>
+                  <p className="note-meta">
+                    {smsLastSentMessage?.status === "예약"
+                      ? "예약이 저장되었습니다. 발송 전까지 예약 발송 관리에서 확인, 수정, 삭제할 수 있습니다."
+                      : "상태는 자동으로 다시 확인하며, 아래에서 보낸 메시지와 수신자별 결과를 바로 볼 수 있습니다."}
+                  </p>
                 </div>
                 {smsLastSentMessage && (
                   <button
@@ -4955,6 +5391,7 @@ function App() {
                       {formatDateTime(smsLastSentMessage.created_at)} · {smsLastSentMessage.content_type} / {smsLastSentMessage.message_type} ·{" "}
                       {smsLastSentMessage.target_count}명
                     </span>
+                    {smsLastSentMessage.scheduled_at && <span>예약 시각: {formatDateTime(smsLastSentMessage.scheduled_at)}</span>}
                     <span>발송 대상: {smsTargetSummaryText(smsLastSentMessage.target_summary)}</span>
                     {smsLastSentMessage.sync_completed_at && <span>최종 확인: {formatDateTime(smsLastSentMessage.sync_completed_at)}</span>}
                   </div>
@@ -5013,10 +5450,14 @@ function App() {
             </article>
             <aside className="sms-side-actions" aria-label="결과 단계 이동">
               <button type="button" onClick={resetSmsSendFlow}>
-                새 문자 발송
+                {smsLastSentMessage?.status === "예약" ? "새 예약 등록" : "새 문자 발송"}
               </button>
-              <button type="button" className="secondary" onClick={() => void openSmsHistoryModal()}>
-                발송 이력 보기
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => void (smsLastSentMessage?.status === "예약" ? openSmsScheduleModal() : openSmsHistoryModal())}
+              >
+                {smsDoneActionLabel}
               </button>
             </aside>
           </div>

@@ -1,10 +1,13 @@
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from app.utils import normalize_phone
+
+
+KST = timezone(timedelta(hours=9))
 
 
 class ErrorResponse(BaseModel):
@@ -499,6 +502,17 @@ class SmsSendRequest(SmsTargetSelection):
         return phones
 
 
+class SmsScheduleRequest(SmsSendRequest):
+    scheduled_at: datetime
+
+    @field_validator("scheduled_at")
+    @classmethod
+    def validate_scheduled_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=KST)
+        return value
+
+
 class SmsMessageRead(BaseModel):
     id: int
     target_type: str | None = None
@@ -514,10 +528,13 @@ class SmsMessageRead(BaseModel):
     provider_name: str | None = None
     provider_request_id: str | None = None
     target_summary: dict[str, Any] | None = None
+    scheduled_at: datetime | None = None
     sent_at: datetime | None = None
+    canceled_at: datetime | None = None
     sync_completed_at: datetime | None = None
     operator_name: str | None = None
     created_at: datetime
+    updated_at: datetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -529,6 +546,8 @@ class SmsMessageRecipientRead(BaseModel):
     member_name: str | None = None
     recipient_name: str | None = None
     phone: str
+    sms_agree: bool
+    source_labels: list[str] = Field(default_factory=list)
     status: str
     provider_message_id: str | None = None
     fail_code: str | None = None

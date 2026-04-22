@@ -68,6 +68,38 @@ def send_sms_message(payload: schemas.SmsSendRequest, db: Session = Depends(get_
     return schemas.SmsMessageRead.model_validate(services.send_sms_message(db, payload))
 
 
+@router.get("/schedules")
+def list_sms_schedules(
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=20, ge=1, le=200),
+    db: Session = Depends(get_db),
+) -> dict:
+    items, total = services.query_sms_schedules(db, page, size)
+    return {
+        "items": [schemas.SmsMessageRead.model_validate(item) for item in items],
+        "total": total,
+        "page": page,
+        "size": size,
+    }
+
+
+@router.post("/schedules", response_model=schemas.SmsMessageRead, status_code=201)
+def create_sms_schedule(payload: schemas.SmsScheduleRequest, db: Session = Depends(get_db)) -> schemas.SmsMessageRead:
+    return schemas.SmsMessageRead.model_validate(services.create_sms_schedule(db, payload))
+
+
+@router.put("/schedules/{message_id}", response_model=schemas.SmsMessageRead)
+def update_sms_schedule(
+    message_id: int, payload: schemas.SmsScheduleRequest, db: Session = Depends(get_db)
+) -> schemas.SmsMessageRead:
+    return schemas.SmsMessageRead.model_validate(services.update_sms_schedule(db, message_id, payload))
+
+
+@router.delete("/schedules/{message_id}", response_model=schemas.SmsMessageRead)
+def cancel_sms_schedule(message_id: int, db: Session = Depends(get_db)) -> schemas.SmsMessageRead:
+    return schemas.SmsMessageRead.model_validate(services.cancel_sms_schedule(db, message_id))
+
+
 @router.get("/history")
 def list_sms_history(
     page: int = Query(default=1, ge=1),
