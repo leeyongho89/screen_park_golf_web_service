@@ -67,6 +67,13 @@ button.danger {
   z-index: 10;
 }
 
+.top-bar-actions {
+  display: grid;
+  gap: 12px;
+  justify-items: end;
+  min-width: 0;
+}
+
 .brand {
   display: flex;
   align-items: center;
@@ -110,6 +117,35 @@ button.danger {
   flex-wrap: wrap;
   gap: 10px;
   justify-content: flex-end;
+}
+
+.top-bar-utility {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+.screen-toggle-button {
+  min-height: 40px;
+  padding: 8px 14px;
+  border: 1px solid #cbd8d2;
+  background: #ffffff;
+  color: #23312e;
+  font-size: 0.95rem;
+  font-weight: 800;
+}
+
+.screen-toggle-button:hover {
+  background: #e8f1ed;
+  color: #176d59;
+}
+
+.screen-toggle-button.active,
+.screen-toggle-button.active:hover {
+  border-color: #1f8a70;
+  background: #1f8a70;
+  color: #ffffff;
 }
 
 .main-nav button {
@@ -2044,6 +2080,21 @@ th {
   gap: 12px;
 }
 
+.sms-result-panel {
+  display: grid;
+  gap: 16px;
+}
+
+.sms-result-section {
+  display: grid;
+  gap: 10px;
+}
+
+.sms-result-message-card {
+  display: grid;
+  gap: 10px;
+}
+
 .sms-result-grid div {
   display: grid;
   gap: 10px;
@@ -2222,6 +2273,15 @@ th {
     flex-direction: column;
   }
 
+  .top-bar-actions {
+    width: 100%;
+    justify-items: stretch;
+  }
+
+  .top-bar-utility {
+    justify-content: flex-start;
+  }
+
   .main-nav {
     justify-content: flex-start;
   }
@@ -2292,6 +2352,14 @@ th {
   main,
   .top-bar {
     padding: 16px;
+  }
+
+  .top-bar-utility {
+    width: 100%;
+  }
+
+  .screen-toggle-button {
+    flex: 1 1 160px;
   }
 
   .brand img {

@@ -771,6 +771,8 @@ function App() {
   const [smsComposeForm, setSmsComposeForm] = useState<SmsComposeForm>(emptySmsComposeForm);
   const [smsSendStep, setSmsSendStep] = useState<SmsSendStep>("target");
   const [smsLastSentMessage, setSmsLastSentMessage] = useState<SmsMessage | null>(null);
+  const [smsLastSentDetailItems, setSmsLastSentDetailItems] = useState<SmsMessageRecipient[]>([]);
+  const [smsLastSentDetailLoading, setSmsLastSentDetailLoading] = useState(false);
   const [smsPreview, setSmsPreview] = useState<SmsPreviewResult | null>(null);
   const [smsPreviewModalOpen, setSmsPreviewModalOpen] = useState(false);
   const [smsPreviewKeyword, setSmsPreviewKeyword] = useState("");
@@ -796,6 +798,9 @@ function App() {
   const [smsMonthlyBillingError, setSmsMonthlyBillingError] = useState("");
   const [smsMonthlyBillingMonth, setSmsMonthlyBillingMonth] = useState(currentMonthValue());
   const [currentTime, setCurrentTime] = useState(() => new Date());
+  const [isFullscreen, setIsFullscreen] = useState(() =>
+    typeof document !== "undefined" ? Boolean(document.fullscreenElement) : false
+  );
   const currentTimeZone = useMemo(() => Intl.DateTimeFormat().resolvedOptions().timeZone || "로컬 시간", []);
 
   const activeSaleProducts = useMemo(() => products.filter((product) => product.is_active), [products]);
@@ -1148,6 +1153,49 @@ function App() {
     setSmsHistory(result.items);
   }
 
+  async function fetchSmsMessageRecipients(messageId: number) {
+    return api<{ message: SmsMessage; items: SmsMessageRecipient[]; total: number }>(`/sms/${messageId}/recipients?size=500`);
+  }
+
+  function applySmsMessageDetailResult(result: { message: SmsMessage; items: SmsMessageRecipient[] }) {
+    setSmsHistory((current) => current.map((item) => (item.id === result.message.id ? result.message : item)));
+  }
+
+  async function openSmsHistoryModal() {
+    setSmsHistoryModalOpen(true);
+    try {
+      await refreshSmsHistory();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "문자 발송 이력을 불러오지 못했습니다.");
+    }
+  }
+
+  async function handleSmsHistoryRefresh() {
+    try {
+      await refreshSmsHistory();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "문자 발송 이력을 불러오지 못했습니다.");
+    }
+  }
+
+  async function refreshSmsLastSentResult(messageId?: number, showNotice = true) {
+    const targetMessageId = messageId ?? smsLastSentMessage?.id;
+    if (!targetMessageId) return;
+    setSmsLastSentDetailLoading(true);
+    try {
+      const result = await fetchSmsMessageRecipients(targetMessageId);
+      applySmsMessageDetailResult(result);
+      setSmsLastSentMessage(result.message);
+      setSmsLastSentDetailItems(result.items);
+    } catch (error) {
+      if (showNotice) {
+        setNotice(error instanceof Error ? error.message : "문자 발송 결과를 불러오지 못했습니다.");
+      }
+    } finally {
+      setSmsLastSentDetailLoading(false);
+    }
+  }
+
   async function refreshSmsMemberOptions() {
     const result = await api<ListResult<Member>>("/members?size=500");
     setSmsMemberOptions(result.items);
@@ -1201,6 +1249,7 @@ function App() {
     setSmsPreviewKeyword("");
     setSmsExcludedRecipients([]);
     setSmsLastSentMessage(null);
+    setSmsLastSentDetailItems([]);
     await refreshSmsData();
   }
 
@@ -1352,6 +1401,8 @@ function App() {
     setSmsPreviewKeyword("");
     setSmsExcludedRecipients([]);
     setSmsLastSentMessage(null);
+    setSmsLastSentDetailItems([]);
+    setSmsLastSentDetailLoading(false);
     setSmsSendStep("target");
   }
 
@@ -1406,6 +1457,7 @@ function App() {
       setSmsExcludedRecipients([]);
       setSmsPreviewModalOpen(false);
       setSmsLastSentMessage(null);
+      setSmsLastSentDetailItems([]);
       setSmsSendStep("review");
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "발송 대상을 불러오지 못했습니다.");
@@ -1471,12 +1523,14 @@ function App() {
       });
       setNotice(message.status === "실패" ? "문자 발송 요청이 실패 이력으로 저장되었습니다." : "문자 발송 요청을 등록했습니다.");
       setSmsLastSentMessage(message);
+      setSmsLastSentDetailItems([]);
       setSmsPreview(null);
       setSmsPreviewModalOpen(false);
       setSmsPreviewKeyword("");
       setSmsExcludedRecipients([]);
       setSmsSendStep("done");
       await refreshSmsHistory();
+      void refreshSmsLastSentResult(message.id, false);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "문자 발송에 실패했습니다.");
     } finally {
@@ -1510,6 +1564,7 @@ function App() {
       setSmsPreviewKeyword("");
       setSmsExcludedRecipients([]);
       setSmsLastSentMessage(null);
+      setSmsLastSentDetailItems([]);
       await refreshSmsGroups();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "문자 그룹 저장에 실패했습니다.");
@@ -1531,6 +1586,7 @@ function App() {
       setSmsPreviewKeyword("");
       setSmsExcludedRecipients([]);
       setSmsLastSentMessage(null);
+      setSmsLastSentDetailItems([]);
       await refreshSmsGroups();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "문자 그룹 삭제에 실패했습니다.");
@@ -1603,9 +1659,12 @@ function App() {
   async function openSmsHistoryDetail(message: SmsMessage) {
     setLoading(true);
     try {
-      const result = await api<{ message: SmsMessage; items: SmsMessageRecipient[]; total: number }>(
-        `/sms/${message.id}/recipients?size=500`
-      );
+      const result = await fetchSmsMessageRecipients(message.id);
+      applySmsMessageDetailResult(result);
+      if (smsLastSentMessage?.id === result.message.id) {
+        setSmsLastSentMessage(result.message);
+        setSmsLastSentDetailItems(result.items);
+      }
       setSmsHistoryDetailTarget(result.message);
       setSmsHistoryDetailItems(result.items);
       setSmsHistoryDetailKeyword("");
@@ -2304,6 +2363,17 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(Boolean(document.fullscreenElement));
+    };
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    handleFullscreenChange();
+    return () => {
+      document.removeEventListener("fullscreenchange", handleFullscreenChange);
+    };
+  }, []);
+
+  useEffect(() => {
     if (!SMS_FEATURE_VISIBLE && activeTab === "sms") {
       setActiveTab("dashboard");
     }
@@ -2365,11 +2435,29 @@ function App() {
   }, [activeTab]);
 
   useEffect(() => {
+    if (!smsHistoryModalOpen || !smsHistory.some((message) => message.status === "발송중")) return;
+    const timer = window.setInterval(() => {
+      void refreshSmsHistory().catch(() => undefined);
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [smsHistory, smsHistoryModalOpen]);
+
+  useEffect(() => {
+    if (smsSendStep !== "done" || !smsLastSentMessage || smsLastSentMessage.status !== "발송중") return;
+    const timer = window.setInterval(() => {
+      void refreshSmsLastSentResult(smsLastSentMessage.id, false);
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [smsLastSentMessage, smsSendStep]);
+
+  useEffect(() => {
     setSmsPreview(null);
     setSmsPreviewModalOpen(false);
     setSmsPreviewKeyword("");
     setSmsExcludedRecipients([]);
     setSmsLastSentMessage(null);
+    setSmsLastSentDetailItems([]);
+    setSmsLastSentDetailLoading(false);
     setSmsSendStep((current) => (current === "review" || current === "done" ? "target" : current));
   }, [
     smsComposeForm.include_all_members,
@@ -2481,6 +2569,18 @@ function App() {
     }));
   }
 
+  async function toggleFullscreen() {
+    try {
+      if (!document.fullscreenElement) {
+        await document.documentElement.requestFullscreen();
+        return;
+      }
+      await document.exitFullscreen();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "전체화면 전환에 실패했습니다.");
+    }
+  }
+
   return (
     <div className="app-shell">
       <header className="top-bar">
@@ -2494,22 +2594,34 @@ function App() {
             </time>
           </div>
         </div>
-        <nav className="main-nav" aria-label="주요 메뉴">
-          {[
-            ["dashboard", "홈"],
-            ["memberInfo", "회원 정보"],
-            ["reservations", "예약"],
-            ["sales", "매출관리"],
-            ["salesSummary", "매출현황"],
-            ["memberships", "보유 상품"],
-            ["products", "상품/요금"],
-            ...(SMS_FEATURE_VISIBLE ? ([["sms", "문자발송"]] as Array<[string, string]>) : [])
-          ].map(([key, label]) => (
-            <button key={key} className={activeTab === key ? "active" : ""} onClick={() => setActiveTab(key as TabKey)}>
-              {label}
+        <div className="top-bar-actions">
+          <div className="top-bar-utility">
+            <button
+              type="button"
+              className={`screen-toggle-button${isFullscreen ? " active" : ""}`}
+              aria-pressed={isFullscreen}
+              onClick={() => void toggleFullscreen()}
+            >
+              {isFullscreen ? "전체화면 종료" : "전체화면"}
             </button>
-          ))}
-        </nav>
+          </div>
+          <nav className="main-nav" aria-label="주요 메뉴">
+            {[
+              ["dashboard", "홈"],
+              ["memberInfo", "회원 정보"],
+              ["reservations", "예약"],
+              ["sales", "매출관리"],
+              ["salesSummary", "매출현황"],
+              ["memberships", "보유 상품"],
+              ["products", "상품/요금"],
+              ...(SMS_FEATURE_VISIBLE ? ([["sms", "문자발송"]] as Array<[string, string]>) : [])
+            ].map(([key, label]) => (
+              <button key={key} className={activeTab === key ? "active" : ""} onClick={() => setActiveTab(key as TabKey)}>
+                {label}
+              </button>
+            ))}
+          </nav>
+        </div>
       </header>
 
       <main>
@@ -4338,9 +4450,14 @@ function App() {
               <h2 id="sms-history-title">발송 이력</h2>
               <p className="note-meta">최근 50건 기준입니다. 총 {smsHistory.length}건</p>
             </div>
-            <button type="button" className="secondary" onClick={() => setSmsHistoryModalOpen(false)}>
-              닫기
-            </button>
+            <div className="table-actions">
+              <button type="button" className="secondary" onClick={() => void handleSmsHistoryRefresh()}>
+                새로고침
+              </button>
+              <button type="button" className="secondary" onClick={() => setSmsHistoryModalOpen(false)}>
+                닫기
+              </button>
+            </div>
           </div>
           {smsHistory.length === 0 ? (
             <p className="empty">등록된 문자 발송 이력이 없습니다.</p>
@@ -4434,7 +4551,7 @@ function App() {
           <button type="button" className="secondary" onClick={openSmsMonthlyBillingModal}>
             월별 청구금액
           </button>
-          <button type="button" className="secondary" onClick={() => setSmsHistoryModalOpen(true)}>
+          <button type="button" className="secondary" onClick={() => void openSmsHistoryModal()}>
             발송 이력 {smsHistory.length}건
           </button>
         </div>
@@ -4797,30 +4914,99 @@ function App() {
               <div className="modal-title-row">
                 <div>
                   <h2>결과</h2>
-                  <p className="note-meta">발송 상세와 수신자별 결과는 발송 이력에서 확인합니다.</p>
+                  <p className="note-meta">상태는 자동으로 다시 확인하며, 아래에서 보낸 메시지와 수신자별 결과를 바로 볼 수 있습니다.</p>
                 </div>
+                {smsLastSentMessage && (
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() => void refreshSmsLastSentResult(undefined, true)}
+                    disabled={smsLastSentDetailLoading}
+                  >
+                    {smsLastSentDetailLoading ? "불러오는 중..." : "결과 새로고침"}
+                  </button>
+                )}
               </div>
               {smsLastSentMessage ? (
-                <div className="sms-result-grid">
-                  <div>
-                    <span>상태</span>
-                    <strong className={`status-chip ${smsLastSentMessage.status === "실패" ? "inactive" : "active"}`}>
-                      {smsLastSentMessage.status}
-                    </strong>
+                <>
+                  <div className="sms-result-grid">
+                    <div>
+                      <span>상태</span>
+                      <strong className={`status-chip ${smsLastSentMessage.status === "실패" ? "inactive" : "active"}`}>
+                        {smsLastSentMessage.status}
+                      </strong>
+                    </div>
+                    <div>
+                      <span>발송 대상</span>
+                      <strong>{smsLastSentMessage.target_count}명</strong>
+                    </div>
+                    <div>
+                      <span>성공</span>
+                      <strong>{smsLastSentMessage.success_count}명</strong>
+                    </div>
+                    <div>
+                      <span>실패</span>
+                      <strong>{smsLastSentMessage.fail_count}명</strong>
+                    </div>
                   </div>
-                  <div>
-                    <span>발송 대상</span>
-                    <strong>{smsLastSentMessage.target_count}명</strong>
+
+                  <div className="sms-history-message-meta">
+                    <span>
+                      {formatDateTime(smsLastSentMessage.created_at)} · {smsLastSentMessage.content_type} / {smsLastSentMessage.message_type} ·{" "}
+                      {smsLastSentMessage.target_count}명
+                    </span>
+                    <span>발송 대상: {smsTargetSummaryText(smsLastSentMessage.target_summary)}</span>
+                    {smsLastSentMessage.sync_completed_at && <span>최종 확인: {formatDateTime(smsLastSentMessage.sync_completed_at)}</span>}
                   </div>
-                  <div>
-                    <span>성공</span>
-                    <strong>{smsLastSentMessage.success_count}명</strong>
+
+                  <div className="sms-result-section">
+                    <div className="sms-preview-heading">
+                      <strong>보낸 메시지</strong>
+                    </div>
+                    <div className="sms-result-message-card">
+                      <div className="sms-flow-summary">
+                        <span>제목: {smsLastSentMessage.title || "제목 없음"}</span>
+                      </div>
+                      <pre className="sms-history-message-content">{smsLastSentMessage.content}</pre>
+                    </div>
                   </div>
-                  <div>
-                    <span>실패</span>
-                    <strong>{smsLastSentMessage.fail_count}명</strong>
+
+                  <div className="sms-result-section">
+                    <div className="sms-preview-heading">
+                      <strong>상세 결과</strong>
+                      <span>{smsLastSentDetailItems.length}건</span>
+                    </div>
+                    <div className="table-wrap">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>이름</th>
+                            <th>연락처</th>
+                            <th>상태</th>
+                            <th>실패 코드</th>
+                            <th>실패 사유</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {smsLastSentDetailItems.map((item) => (
+                            <tr key={item.id}>
+                              <td>{item.recipient_name || item.member_name || "-"}</td>
+                              <td>{displayPhone(item.phone)}</td>
+                              <td>{item.status}</td>
+                              <td>{item.fail_code || "-"}</td>
+                              <td className="memo-cell">{item.fail_reason || "-"}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                      {smsLastSentDetailItems.length === 0 && (
+                        <p className="empty">
+                          {smsLastSentDetailLoading ? "상세 결과를 불러오는 중입니다." : "상세 결과가 아직 없습니다. 잠시 후 다시 확인해 주세요."}
+                        </p>
+                      )}
+                    </div>
                   </div>
-                </div>
+                </>
               ) : (
                 <p className="empty">아직 발송 결과가 없습니다.</p>
               )}
@@ -4829,7 +5015,7 @@ function App() {
               <button type="button" onClick={resetSmsSendFlow}>
                 새 문자 발송
               </button>
-              <button type="button" className="secondary" onClick={() => setSmsHistoryModalOpen(true)}>
+              <button type="button" className="secondary" onClick={() => void openSmsHistoryModal()}>
                 발송 이력 보기
               </button>
             </aside>

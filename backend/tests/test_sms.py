@@ -12,8 +12,9 @@ class FakeSmsProvider:
             "statusName": "success",
         }
 
-    def list_messages(self, *, request_id, page_size=100, page_index=1, next_token=None):
+    def list_messages(self, *, request_id, page_size=100, page_index=0, next_token=None):
         assert request_id == "REQ-001"
+        assert page_index == 0
         return {
             "statusCode": "202",
             "statusName": "success",
@@ -57,6 +58,57 @@ class FakeSmsProvider:
                     "statusName": "success",
                     "statusMessage": "",
                     "to": "01011112222" if message_id == "MSG-001" else "01033334444",
+                }
+            ],
+        }
+
+
+class DeferredSmsProvider(FakeSmsProvider):
+    def __init__(self):
+        self.list_call_count = 0
+
+    def list_messages(self, *, request_id, page_size=100, page_index=0, next_token=None):
+        self.list_call_count += 1
+        status = "PROCESSING" if self.list_call_count == 1 else "COMPLETED"
+        status_code = "" if status == "PROCESSING" else "0"
+        status_name = "" if status == "PROCESSING" else "success"
+        return {
+            "statusCode": "202",
+            "statusName": "success",
+            "messages": [
+                {
+                    "requestId": request_id,
+                    "messageId": "MSG-001",
+                    "requestTime": "2026-04-12 10:00:00",
+                    "completeTime": None if status == "PROCESSING" else "2026-04-12 10:00:01",
+                    "to": "01011112222",
+                    "status": status,
+                    "statusCode": status_code,
+                    "statusName": status_name,
+                    "statusMessage": "",
+                }
+            ],
+            "hasMore": False,
+        }
+
+    def get_message(self, *, message_id):
+        status = "PROCESSING" if self.list_call_count == 1 else "COMPLETED"
+        status_code = "" if status == "PROCESSING" else "0"
+        status_name = "" if status == "PROCESSING" else "success"
+        return {
+            "statusCode": "200",
+            "statusName": "success",
+            "messages": [
+                {
+                    "requestId": "REQ-001",
+                    "messageId": message_id,
+                    "requestTime": "2026-04-12 10:00:00",
+                    "completeTime": None if status == "PROCESSING" else "2026-04-12 10:00:01",
+                    "status": status,
+                    "statusCode": status_code,
+                    "statusName": status_name,
+                    "statusMessage": "",
+                    "to": "01011112222",
                 }
             ],
         }
@@ -242,6 +294,39 @@ def test_sms_send_saves_history_and_recipient_details(client, monkeypatch):
     assert recipients.json()["total"] == 1
     assert recipients.json()["items"][0]["phone"] == "01033334444"
     assert recipients.json()["items"][0]["status"] == "성공"
+
+
+def test_sms_history_syncs_pending_messages(client, monkeypatch):
+    provider = DeferredSmsProvider()
+    monkeypatch.setattr(services, "get_sms_provider", lambda: provider)
+
+    client.post("/api/members", json={"name": "대기회원", "phone": "010-1111-2222"})
+
+    send = client.post(
+        "/api/sms/send",
+        json={
+            "include_all_members": True,
+            "content_type": "COMM",
+            "content": "발송 상태 확인 문자입니다.",
+            "excluded_member_ids": [],
+            "excluded_phones": [],
+        },
+    )
+
+    assert send.status_code == 201
+    sent_message = send.json()
+    assert sent_message["status"] == "발송중"
+    assert sent_message["success_count"] == 0
+    assert sent_message["fail_count"] == 0
+
+    history = client.get("/api/sms/history?size=10")
+
+    assert history.status_code == 200
+    history_message = history.json()["items"][0]
+    assert history_message["id"] == sent_message["id"]
+    assert history_message["status"] == "완료"
+    assert history_message["success_count"] == 1
+    assert history_message["fail_count"] == 0
 
 
 def test_sms_monthly_billing_returns_matching_items(client, monkeypatch):

@@ -1756,7 +1756,7 @@ def sync_sms_message_delivery(
 
     next_token: str | None = None
     while True:
-        result = provider.list_messages(request_id=message.provider_request_id, page_size=100, page_index=1, next_token=next_token)
+        result = provider.list_messages(request_id=message.provider_request_id, page_size=100, page_index=0, next_token=next_token)
         for item in result.get("messages", []):
             phone = normalize_phone(item.get("to"))
             recipient = recipients_by_phone.get(phone or "")
@@ -1913,7 +1913,16 @@ def send_sms_message(
 def query_sms_history(db: Session, page: int, size: int) -> tuple[list[models.SmsMessage], int]:
     stmt = select(models.SmsMessage)
     total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    items = db.scalars(stmt.order_by(models.SmsMessage.created_at.desc(), models.SmsMessage.id.desc()).offset((page - 1) * size).limit(size)).all()
+    paged_stmt = stmt.order_by(models.SmsMessage.created_at.desc(), models.SmsMessage.id.desc()).offset((page - 1) * size).limit(size)
+    items = db.scalars(paged_stmt).all()
+    pending_ids = [item.id for item in items if item.status == "발송중" and item.provider_request_id]
+    if pending_ids:
+        for message_id in pending_ids:
+            try:
+                sync_sms_message_delivery(db, message_id)
+            except Exception:
+                db.rollback()
+        items = db.scalars(paged_stmt).all()
     return list(items), total
 
 

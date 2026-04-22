@@ -100,7 +100,7 @@ class NaverSensSmsProvider(NcloudApiClient):
             body["subject"] = title or ""
         return self._request("POST", path, json_body=body)
 
-    def list_messages(self, *, request_id: str, page_size: int = 100, page_index: int = 1, next_token: str | None = None) -> dict[str, Any]:
+    def list_messages(self, *, request_id: str, page_size: int = 100, page_index: int = 0, next_token: str | None = None) -> dict[str, Any]:
         path = f"/sms/v2/services/{self.service_id}/messages"
         params: dict[str, Any] = {
             "requestId": request_id,
