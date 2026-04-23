@@ -1,4 +1,36 @@
 $DistroName = "Ubuntu"
 $ServiceName = "screen-golf.service"
+$KeepAliveUnitName = "screen-golf-wsl-keepalive"
+$WindowsKeepAliveMarker = "screen-golf-windows-keepalive"
 
+function Test-WindowsKeepAliveProcess {
+    $processes = Get-CimInstance Win32_Process -Filter "Name = 'wsl.exe'" |
+        Where-Object {
+            $_.CommandLine -like "*$WindowsKeepAliveMarker*" -and
+            $_.CommandLine -like "*-d $DistroName*"
+        }
+
+    return $null -ne $processes
+}
+
+function Start-WindowsKeepAliveProcess {
+    if (Test-WindowsKeepAliveProcess) {
+        return
+    }
+
+    $keepAliveCommand = "while systemctl is-active --quiet ${KeepAliveUnitName}.service; do sleep 300; done # $WindowsKeepAliveMarker"
+    $arguments = @(
+        "-d", $DistroName,
+        "--user", "root",
+        "--",
+        "/bin/sh",
+        "-lc",
+        $keepAliveCommand
+    )
+
+    Start-Process -FilePath "wsl.exe" -ArgumentList $arguments -WindowStyle Hidden | Out-Null
+}
+
+wsl.exe -d $DistroName --user root -- systemctl start "${KeepAliveUnitName}.service"
+Start-WindowsKeepAliveProcess
 wsl.exe -d $DistroName --user root -- systemctl start $ServiceName

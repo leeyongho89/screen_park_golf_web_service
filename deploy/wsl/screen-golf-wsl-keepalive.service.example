@@ -1,0 +1,12 @@
+[Unit]
+Description=Keep WSL alive for Screen Park Golf Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/bin/sleep infinity
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

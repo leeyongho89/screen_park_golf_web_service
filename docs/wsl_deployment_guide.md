@@ -250,6 +250,7 @@ docker compose exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /docker-
 - `deploy/wsl/start-screen-golf.sh`
 - `deploy/wsl/stop-screen-golf.sh`
 - `deploy/wsl/screen-golf.service.example`
+- `deploy/wsl/screen-golf-wsl-keepalive.service.example`
 
 실행 권한 부여:
 
@@ -263,15 +264,27 @@ systemd 서비스 등록:
 
 ```bash
 sudo cp deploy/wsl/screen-golf.service.example /etc/systemd/system/screen-golf.service
+sudo cp deploy/wsl/screen-golf-wsl-keepalive.service.example /etc/systemd/system/screen-golf-wsl-keepalive.service
 sudo systemctl daemon-reload
+sudo systemctl enable screen-golf-wsl-keepalive.service
+sudo systemctl start screen-golf-wsl-keepalive.service
 sudo systemctl enable screen-golf.service
 sudo systemctl start screen-golf.service
 ```
+
+주의:
+
+- 현재 예시는 `Type=oneshot + RemainAfterExit=yes`로 동작합니다.
+- `ExecStart`는 `docker compose up -d`를 실행하고, `ExecStop`은 명시적으로 중지할 때만 `docker compose down`을 실행합니다.
+- `screen-golf-wsl-keepalive.service`는 `/bin/sleep infinity` 하나만 유지하는 매우 가벼운 유닛입니다.
+- 이 유닛이 없으면 `screen-golf.service`가 `active (exited)` 상태여도 마지막 셸 종료 시 WSL이 바로 `Stopped`로 내려갈 수 있습니다.
+- `Type=simple`에 포그라운드 `docker compose up`을 직접 넣으면 컨테이너 상태 변화가 systemd 실패로 연결돼 서비스가 다시 내려갈 수 있으니 피합니다.
 
 확인:
 
 ```bash
 systemctl status screen-golf.service
+systemctl status screen-golf-wsl-keepalive.service
 docker compose ps
 ```
 
@@ -285,6 +298,8 @@ docker compose ps
 
 이 저장소에 Windows 예시 스크립트가 들어 있습니다.
 
+- `deploy/windows/start-screen-golf-wsl.cmd`
+- `deploy/windows/start-screen-golf-wsl.ps1`
 - `deploy/windows/start-screen-golf-wsl.ps1.example`
 
 예시 내용:
@@ -294,6 +309,20 @@ $DistroName = "Ubuntu"
 $ServiceName = "screen-golf.service"
 wsl.exe -d $DistroName --user root -- systemctl start $ServiceName
 ```
+
+현재 저장소의 `start-screen-golf-wsl.ps1` 는 여기에 더해 아래 2가지를 같이 처리합니다.
+
+- WSL 안의 `screen-golf-wsl-keepalive.service` 시작
+- Windows 쪽에서 숨김 `wsl.exe` 프로세스를 하나 더 띄워, 위 keepalive 유닛이 살아 있는 동안만 WSL 세션 유지
+
+이유는 Microsoft 문서 기준으로, `systemd` 서비스만으로는 WSL 인스턴스를 계속 살려두지 않기 때문입니다.
+즉 Linux 안쪽의 `sleep infinity` 유닛만으로는 일부 환경에서 `wsl -l -v`가 잠시 `Running`이었다가 다시 `Stopped`로 내려갈 수 있습니다.
+
+주의:
+
+- 실제 동작 기준 이름은 `start-screen-golf-wsl.*`를 사용합니다.
+- Windows 작업 스케줄러에서는 WSL을 강제로 종료하는 방식보다, 위처럼 `systemctl start`만 호출하는 방식을 권장합니다.
+- `wsl.exe --terminate`를 먼저 실행하면 종료 과정에서 컨테이너가 중간 상태로 남을 수 있습니다.
 
 ### 작업 스케줄러 등록 방법
 
@@ -424,7 +453,51 @@ wsl -l -v
 schtasks /Query /TN "Start Screen Golf WSL" /V /FO LIST
 ```
 
-### 5) 포트 충돌
+### 5) `wsl -l -v` 에서 잠깐 `Running` 이었다가 다시 `Stopped` 로 내려감
+
+원인:
+
+- `screen-golf-wsl-keepalive.service` 가 살아 있지 않음
+- `systemd` 가 WSL 안에서 정상 기동하지 않음
+- Windows 시작 스크립트가 keepalive 유닛 시작 전에 종료됨
+- `%UserProfile%\\.wslconfig` 의 기본 `vmIdleTimeout` 영향으로 WSL VM이 유휴 상태로 판단됨
+
+확인:
+
+```powershell
+wsl -d Ubuntu --user root -- systemctl status screen-golf-wsl-keepalive.service
+wsl -d Ubuntu --user root -- systemctl status screen-golf.service
+wsl -d Ubuntu --user root -- journalctl -u screen-golf-wsl-keepalive.service -n 50 --no-pager
+wsl -d Ubuntu --user root -- ps -p 1 -o comm=
+```
+
+정상 기준:
+
+- `screen-golf-wsl-keepalive.service` 는 `active (running)`
+- `screen-golf.service` 는 `active (exited)` 또는 재시작 직후 잠시 `activating`
+- `ps -p 1 -o comm=` 결과는 `systemd`
+
+조치:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable screen-golf-wsl-keepalive.service
+sudo systemctl restart screen-golf-wsl-keepalive.service
+sudo systemctl restart screen-golf.service
+systemctl status screen-golf-wsl-keepalive.service
+systemctl status screen-golf.service
+```
+
+Windows 쪽 시작 스크립트도 최신 저장소 버전으로 다시 배치합니다.
+
+필요하면 Windows 사용자 홈의 `%UserProfile%\.wslconfig` 에 아래 설정을 추가한 뒤 `wsl --shutdown` 으로 전체 재시작합니다.
+
+```ini
+[wsl2]
+vmIdleTimeout=0
+```
+
+### 6) 포트 충돌
 
 현재 기본 포트:
 

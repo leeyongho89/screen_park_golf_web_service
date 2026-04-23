@@ -6,9 +6,9 @@ Wants=network-online.target docker.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-WorkingDirectory=/opt/screen_park_golf_service
-ExecStart=/opt/screen_park_golf_service/deploy/wsl/start-screen-golf.sh
-ExecStop=/opt/screen_park_golf_service/deploy/wsl/stop-screen-golf.sh
+WorkingDirectory=/home/user/app/screen_park_golf_web_service
+ExecStart=/home/user/app/screen_park_golf_web_service/deploy/wsl/start-screen-golf.sh
+ExecStop=/home/user/app/screen_park_golf_web_service/deploy/wsl/stop-screen-golf.sh
 TimeoutStartSec=0
 
 [Install]
