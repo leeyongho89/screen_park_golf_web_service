@@ -1,6 +1,6 @@
 from datetime import date, timedelta
 
-from app import services
+from app import models, services
 
 
 class FakeSmsProvider:
@@ -208,6 +208,185 @@ class ScheduledSmsProvider(FakeSmsProvider):
         return super().get_message(message_id=message_id)
 
 
+class PaginatedSmsProvider(FakeSmsProvider):
+    def __init__(self):
+        self.sent_recipients = []
+
+    def send_messages(self, *, recipients, content, title, content_type, message_type, reserve_time=None, reserve_time_zone=None):
+        self.sent_recipients = recipients
+        return {
+            "requestId": "REQ-PAGED",
+            "requestTime": "2026-04-12 10:00:00",
+            "statusCode": "202",
+            "statusName": "success",
+        }
+
+    def list_messages(self, *, request_id, page_size=100, page_index=0, next_token=None):
+        assert request_id == "REQ-PAGED"
+        start = int(next_token) if next_token else page_index * page_size
+        end = min(start + page_size, len(self.sent_recipients))
+        messages = []
+        for idx, phone in enumerate(self.sent_recipients[start:end], start=start):
+            is_failure = idx >= len(self.sent_recipients) - 2
+            messages.append(
+                {
+                    "requestId": request_id,
+                    "messageId": f"MSG-PAGED-{idx + 1:03d}",
+                    "requestTime": "2026-04-12 10:00:00",
+                    "completeTime": "2026-04-12 10:00:01",
+                    "to": phone,
+                    "status": "COMPLETED",
+                    "statusCode": "3001" if is_failure else "0",
+                    "statusName": "fail" if is_failure else "success",
+                    "statusMessage": "carrier rejected" if is_failure else "",
+                }
+            )
+        has_more = end < len(self.sent_recipients)
+        return {
+            "statusCode": "202",
+            "statusName": "success",
+            "messages": messages,
+            "hasMore": has_more,
+            "nextToken": str(end) if has_more else None,
+        }
+
+
+class DelayedResolutionSmsProvider(FakeSmsProvider):
+    def __init__(self):
+        self.sent_recipients = []
+        self.sync_round = 0
+
+    def send_messages(self, *, recipients, content, title, content_type, message_type, reserve_time=None, reserve_time_zone=None):
+        self.sent_recipients = recipients
+        return {
+            "requestId": "REQ-DELAYED",
+            "requestTime": "2026-04-12 10:00:00",
+            "statusCode": "202",
+            "statusName": "success",
+        }
+
+    def _current_round(self, *, page_index, next_token):
+        if page_index == 0 and not next_token:
+            self.sync_round += 1
+        return self.sync_round
+
+    def _message_payload(self, request_id: str, idx: int, *, round_number: int) -> dict:
+        phone = self.sent_recipients[idx]
+        if round_number == 1 and idx >= 99:
+            return {
+                "requestId": request_id,
+                "messageId": f"MSG-DELAYED-{idx + 1:03d}",
+                "requestTime": "2026-04-12 10:00:00",
+                "completeTime": None,
+                "to": phone,
+                "status": "PROCESSING",
+                "statusCode": "",
+                "statusName": "",
+                "statusMessage": "",
+            }
+        is_failure = idx >= len(self.sent_recipients) - 2
+        return {
+            "requestId": request_id,
+            "messageId": f"MSG-DELAYED-{idx + 1:03d}",
+            "requestTime": "2026-04-12 10:00:00",
+            "completeTime": "2026-04-12 10:00:01",
+            "to": phone,
+            "status": "COMPLETED",
+            "statusCode": "3001" if is_failure else "0",
+            "statusName": "fail" if is_failure else "success",
+            "statusMessage": "carrier rejected" if is_failure else "",
+        }
+
+    def list_messages(self, *, request_id, page_size=100, page_index=0, next_token=None):
+        assert request_id == "REQ-DELAYED"
+        round_number = self._current_round(page_index=page_index, next_token=next_token)
+        start = int(next_token) if next_token else page_index * page_size
+        end = min(start + page_size, len(self.sent_recipients))
+        messages = [self._message_payload(request_id, idx, round_number=round_number) for idx in range(start, end)]
+        has_more = end < len(self.sent_recipients)
+        return {
+            "statusCode": "202",
+            "statusName": "success",
+            "messages": messages,
+            "hasMore": has_more,
+            "nextToken": str(end) if has_more else None,
+        }
+
+    def get_message(self, *, message_id):
+        idx = int(message_id.rsplit("-", 1)[-1]) - 1
+        payload = self._message_payload("REQ-DELAYED", idx, round_number=self.sync_round)
+        return {
+            "statusCode": "200",
+            "statusName": "success",
+            "messages": [payload],
+        }
+
+
+class DuplicatePhoneSmsProvider(FakeSmsProvider):
+    def list_messages(self, *, request_id, page_size=100, page_index=0, next_token=None):
+        assert request_id == "REQ-DUPLICATE"
+        return {
+            "statusCode": "202",
+            "statusName": "success",
+            "messages": [
+                {
+                    "requestId": request_id,
+                    "messageId": "MSG-DUP-001",
+                    "requestTime": "2026-04-12 10:00:00",
+                    "completeTime": "2026-04-12 10:00:01",
+                    "to": "01077778888",
+                    "status": "COMPLETED",
+                    "statusCode": "0",
+                    "statusName": "success",
+                    "statusMessage": "",
+                },
+                {
+                    "requestId": request_id,
+                    "messageId": "MSG-DUP-002",
+                    "requestTime": "2026-04-12 10:00:00",
+                    "completeTime": "2026-04-12 10:00:01",
+                    "to": "01077778888",
+                    "status": "COMPLETED",
+                    "statusCode": "3001",
+                    "statusName": "fail",
+                    "statusMessage": "carrier rejected",
+                },
+            ],
+            "hasMore": False,
+        }
+
+    def get_message(self, *, message_id):
+        detail = {
+            "MSG-DUP-001": {
+                "requestId": "REQ-DUPLICATE",
+                "messageId": "MSG-DUP-001",
+                "requestTime": "2026-04-12 10:00:00",
+                "completeTime": "2026-04-12 10:00:01",
+                "to": "01077778888",
+                "status": "COMPLETED",
+                "statusCode": "0",
+                "statusName": "success",
+                "statusMessage": "",
+            },
+            "MSG-DUP-002": {
+                "requestId": "REQ-DUPLICATE",
+                "messageId": "MSG-DUP-002",
+                "requestTime": "2026-04-12 10:00:00",
+                "completeTime": "2026-04-12 10:00:01",
+                "to": "01077778888",
+                "status": "COMPLETED",
+                "statusCode": "3001",
+                "statusName": "fail",
+                "statusMessage": "carrier rejected",
+            },
+        }
+        return {
+            "statusCode": "200",
+            "statusName": "success",
+            "messages": [detail[message_id]],
+        }
+
+
 class FakeBillingClient:
     def __init__(self, response):
         self.response = response
@@ -216,6 +395,19 @@ class FakeBillingClient:
     def get_product_demand_cost_list(self, *, start_month, end_month):
         self.called_with = (start_month, end_month)
         return self.response
+
+
+def create_members(client, count: int, *, name_prefix: str, phone_prefix: str = "01055"):
+    members = []
+    for idx in range(count):
+        phone = f"{phone_prefix}{idx:06d}"[-11:]
+        members.append(
+            client.post(
+                "/api/members",
+                json={"name": f"{name_prefix}{idx + 1}", "phone": phone},
+            ).json()
+        )
+    return members
 
 
 def test_sms_group_and_template_crud(client):
@@ -421,6 +613,154 @@ def test_sms_history_syncs_pending_messages(client, monkeypatch):
     assert history_message["status"] == "완료"
     assert history_message["success_count"] == 1
     assert history_message["fail_count"] == 0
+
+
+def test_sms_send_syncs_all_paginated_results(client, monkeypatch):
+    provider = PaginatedSmsProvider()
+    monkeypatch.setattr(services, "get_sms_provider", lambda: provider)
+
+    create_members(client, 115, name_prefix="페이지회원")
+
+    send = client.post(
+        "/api/sms/send",
+        json={
+            "include_all_members": True,
+            "content_type": "COMM",
+            "content": "페이지 전체 동기화 확인 문자입니다.",
+            "excluded_member_ids": [],
+            "excluded_phones": [],
+        },
+    )
+
+    assert send.status_code == 201
+    message = send.json()
+    assert message["target_count"] == 115
+    assert message["success_count"] == 113
+    assert message["fail_count"] == 2
+    assert message["status"] == "완료"
+
+    recipients = client.get(f"/api/sms/{message['id']}/recipients?size=200")
+    assert recipients.status_code == 200
+    assert recipients.json()["total"] == 115
+    assert sum(1 for item in recipients.json()["items"] if item["status"] == "성공") == 113
+    assert sum(1 for item in recipients.json()["items"] if item["status"] == "실패") == 2
+
+
+def test_sms_history_refresh_resolves_processing_recipients(client, monkeypatch):
+    provider = DelayedResolutionSmsProvider()
+    monkeypatch.setattr(services, "get_sms_provider", lambda: provider)
+
+    create_members(client, 115, name_prefix="지연회원", phone_prefix="01066")
+
+    send = client.post(
+        "/api/sms/send",
+        json={
+            "include_all_members": True,
+            "content_type": "COMM",
+            "content": "처리중 동기화 확인 문자입니다.",
+            "excluded_member_ids": [],
+            "excluded_phones": [],
+        },
+    )
+
+    assert send.status_code == 201
+    sent_message = send.json()
+    assert sent_message["target_count"] == 115
+    assert sent_message["status"] == "발송중"
+    assert sent_message["success_count"] == 99
+    assert sent_message["fail_count"] == 0
+
+    history = client.get("/api/sms/history?size=10")
+    assert history.status_code == 200
+    history_message = history.json()["items"][0]
+    assert history_message["id"] == sent_message["id"]
+    assert history_message["status"] == "완료"
+    assert history_message["success_count"] == 113
+    assert history_message["fail_count"] == 2
+
+    recipients = client.get(f"/api/sms/{sent_message['id']}/recipients?size=200")
+    assert recipients.status_code == 200
+    assert sum(1 for item in recipients.json()["items"] if item["status"] == "발송중") == 0
+    assert sum(1 for item in recipients.json()["items"] if item["status"] == "성공") == 113
+    assert sum(1 for item in recipients.json()["items"] if item["status"] == "실패") == 2
+
+
+def test_sms_recipient_detail_resyncs_incomplete_completed_message(client, db_session, monkeypatch):
+    provider = DelayedResolutionSmsProvider()
+    monkeypatch.setattr(services, "get_sms_provider", lambda: provider)
+
+    create_members(client, 115, name_prefix="복구회원", phone_prefix="01067")
+
+    send = client.post(
+        "/api/sms/send",
+        json={
+            "include_all_members": True,
+            "content_type": "COMM",
+            "content": "불완전 완료 복구 문자입니다.",
+            "excluded_member_ids": [],
+            "excluded_phones": [],
+        },
+    )
+
+    assert send.status_code == 201
+    message_id = send.json()["id"]
+
+    message = db_session.get(models.SmsMessage, message_id)
+    message.status = "완료"
+    db_session.commit()
+
+    recipients = client.get(f"/api/sms/{message_id}/recipients?size=200")
+    assert recipients.status_code == 200
+    payload = recipients.json()
+    assert payload["message"]["status"] == "완료"
+    assert payload["message"]["success_count"] == 113
+    assert payload["message"]["fail_count"] == 2
+    assert sum(1 for item in payload["items"] if item["status"] == "발송중") == 0
+
+
+def test_sync_sms_delivery_matches_duplicate_phone_recipients(db_session):
+    provider = DuplicatePhoneSmsProvider()
+    message = models.SmsMessage(
+        target_type="전체 회원",
+        content="중복 번호 확인 문자입니다.",
+        content_type="COMM",
+        message_type="SMS",
+        target_count=2,
+        success_count=0,
+        fail_count=0,
+        status="발송중",
+        provider_name="NAVER_SENS",
+        provider_request_id="REQ-DUPLICATE",
+    )
+    db_session.add(message)
+    db_session.flush()
+    db_session.add_all(
+        [
+            models.SmsMessageRecipient(
+                sms_message_id=message.id,
+                recipient_name="중복1",
+                phone="01077778888",
+                sms_agree=True,
+                status="발송중",
+            ),
+            models.SmsMessageRecipient(
+                sms_message_id=message.id,
+                recipient_name="중복2",
+                phone="01077778888",
+                sms_agree=True,
+                status="발송중",
+            ),
+        ]
+    )
+    db_session.commit()
+
+    synced = services.sync_sms_message_delivery(db_session, message.id, provider)
+
+    assert synced.status == "완료"
+    assert synced.success_count == 1
+    assert synced.fail_count == 1
+    assert sorted(item.provider_message_id for item in synced.recipients) == ["MSG-DUP-001", "MSG-DUP-002"]
+    assert sorted(item.status for item in synced.recipients) == ["성공", "실패"]
 
 
 def test_sms_schedule_crud(client, monkeypatch):

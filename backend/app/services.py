@@ -1,5 +1,6 @@
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+import logging
 import re
 from typing import Any
 
@@ -23,6 +24,9 @@ RESERVATION_STATUSES = {"예약", "취소"}
 SMS_SCHEDULE_LIST_STATUSES = {"예약", "예약취소"}
 SMS_SCHEDULE_SYNC_STATUSES = {"예약", "발송중"}
 SMS_HISTORY_EXCLUDED_STATUSES = {"예약", "예약취소"}
+SMS_FINAL_RECIPIENT_STATUSES = {"성공", "실패"}
+
+logger = logging.getLogger(__name__)
 
 
 def fail(status_code: int, code: str, message: str) -> None:
@@ -1969,6 +1973,11 @@ def apply_sms_delivery_result(recipient: models.SmsMessageRecipient, payload: di
     if request_status in {"READY", "PROCESSING"}:
         recipient.status = "발송중"
         return
+    if request_status in {"FAIL", "FAILED", "REJECTED", "CANCELED"}:
+        recipient.status = "실패"
+        recipient.fail_code = receipt_code or request_status or recipient.fail_code
+        recipient.fail_reason = status_message or recipient.fail_reason or "문자 발송이 실패했습니다."
+        return
     if request_status == "COMPLETED":
         if receipt_status == "success" or receipt_code == "0":
             recipient.status = "성공"
@@ -1982,6 +1991,24 @@ def apply_sms_delivery_result(recipient: models.SmsMessageRecipient, payload: di
             recipient.status = "발송중"
 
 
+def expected_sms_recipient_count(message: models.SmsMessage) -> int:
+    return max(message.target_count, len(message.recipients))
+
+
+def is_sms_message_delivery_incomplete(message: models.SmsMessage) -> bool:
+    return message.success_count + message.fail_count < expected_sms_recipient_count(message)
+
+
+def should_sync_sms_runtime_state(message: models.SmsMessage) -> bool:
+    if not message.provider_request_id:
+        return False
+    if message.scheduled_at and message.status == "예약":
+        return True
+    if message.status in SMS_HISTORY_EXCLUDED_STATUSES:
+        return False
+    return message.status == "발송중" or is_sms_message_delivery_incomplete(message)
+
+
 def update_sms_message_counts(message: models.SmsMessage) -> None:
     message.success_count = sum(1 for item in message.recipients if item.status == "성공")
     message.fail_count = sum(1 for item in message.recipients if item.status == "실패")
@@ -1992,11 +2019,77 @@ def update_sms_message_counts(message: models.SmsMessage) -> None:
         message.status = "실패"
         message.sync_completed_at = datetime.now(timezone.utc)
         return
-    if message.success_count + message.fail_count == len(message.recipients):
-        message.status = "실패" if message.fail_count == len(message.recipients) else "완료"
+
+    expected_count = expected_sms_recipient_count(message)
+    resolved_count = message.success_count + message.fail_count
+    if resolved_count == expected_count:
+        message.status = "실패" if message.fail_count == expected_count else "완료"
         message.sync_completed_at = datetime.now(timezone.utc)
-    elif message.success_count or any(item.status == "발송중" for item in message.recipients):
+    else:
         message.status = "발송중"
+        message.sync_completed_at = None
+
+
+def build_sms_delivery_indexes(
+    message: models.SmsMessage,
+) -> tuple[dict[str, list[models.SmsMessageRecipient]], dict[str, models.SmsMessageRecipient]]:
+    recipients_by_phone: dict[str, list[models.SmsMessageRecipient]] = {}
+    recipients_by_message_id: dict[str, models.SmsMessageRecipient] = {}
+    for recipient in sorted(message.recipients, key=lambda item: item.id):
+        phone = normalize_phone(recipient.phone)
+        if phone:
+            recipients_by_phone.setdefault(phone, []).append(recipient)
+        if recipient.provider_message_id:
+            recipients_by_message_id[str(recipient.provider_message_id)] = recipient
+    return recipients_by_phone, recipients_by_message_id
+
+
+def match_sms_delivery_recipient(
+    *,
+    item: dict[str, Any],
+    recipients_by_phone: dict[str, list[models.SmsMessageRecipient]],
+    recipients_by_message_id: dict[str, models.SmsMessageRecipient],
+    claimed_recipient_ids: set[int],
+) -> models.SmsMessageRecipient | None:
+    provider_message_id = str(item.get("messageId") or "").strip() or None
+    if provider_message_id and provider_message_id in recipients_by_message_id:
+        recipient = recipients_by_message_id[provider_message_id]
+        claimed_recipient_ids.add(recipient.id)
+        return recipient
+
+    phone = normalize_phone(item.get("to"))
+    candidates = recipients_by_phone.get(phone or "", [])
+    if not candidates:
+        return None
+
+    if provider_message_id:
+        for candidate in candidates:
+            if candidate.provider_message_id == provider_message_id:
+                recipients_by_message_id[provider_message_id] = candidate
+                claimed_recipient_ids.add(candidate.id)
+                return candidate
+
+    for candidate in candidates:
+        if candidate.id not in claimed_recipient_ids and not candidate.provider_message_id:
+            if provider_message_id:
+                recipients_by_message_id[provider_message_id] = candidate
+            claimed_recipient_ids.add(candidate.id)
+            return candidate
+
+    for candidate in candidates:
+        if candidate.id not in claimed_recipient_ids and (not provider_message_id or candidate.provider_message_id == provider_message_id):
+            if provider_message_id:
+                recipients_by_message_id[provider_message_id] = candidate
+            claimed_recipient_ids.add(candidate.id)
+            return candidate
+
+    if len(candidates) == 1:
+        candidate = candidates[0]
+        if provider_message_id:
+            recipients_by_message_id[provider_message_id] = candidate
+        return candidate
+
+    return None
 
 
 def sync_sms_schedule_status(
@@ -2053,35 +2146,96 @@ def sync_sms_message_delivery(
         return message
 
     provider = provider or get_sms_provider()
-    recipients_by_phone: dict[str, models.SmsMessageRecipient] = {}
-    for recipient in message.recipients:
-        phone = normalize_phone(recipient.phone)
-        if phone and phone not in recipients_by_phone:
-            recipients_by_phone[phone] = recipient
+    recipients_by_phone, recipients_by_message_id = build_sms_delivery_indexes(message)
 
     next_token: str | None = None
+    seen_page_states: set[tuple[int, str | None]] = set()
+    page_index = 0
+    claimed_recipient_ids: set[int] = set()
+    page_count = 0
+    provider_item_count = 0
+    matched_item_count = 0
+    unmatched_item_count = 0
     while True:
-        result = provider.list_messages(request_id=message.provider_request_id, page_size=100, page_index=0, next_token=next_token)
+        page_state = (page_index, next_token)
+        if page_state in seen_page_states:
+            logger.warning(
+                "SMS sync pagination loop detected for message_id=%s request_id=%s page_index=%s next_token=%s",
+                message.id,
+                message.provider_request_id,
+                page_index,
+                next_token,
+            )
+            break
+        seen_page_states.add(page_state)
+
+        result = provider.list_messages(
+            request_id=message.provider_request_id,
+            page_size=100,
+            page_index=page_index,
+            next_token=next_token,
+        )
+        page_count += 1
         for item in result.get("messages", []):
-            phone = normalize_phone(item.get("to"))
-            recipient = recipients_by_phone.get(phone or "")
-            if not recipient and item.get("messageId"):
-                recipient = next((target for target in message.recipients if target.provider_message_id == item.get("messageId")), None)
+            provider_item_count += 1
+            recipient = match_sms_delivery_recipient(
+                item=item,
+                recipients_by_phone=recipients_by_phone,
+                recipients_by_message_id=recipients_by_message_id,
+                claimed_recipient_ids=claimed_recipient_ids,
+            )
             if not recipient:
+                unmatched_item_count += 1
                 continue
             apply_sms_delivery_result(recipient, item)
-        next_token = result.get("nextToken")
-        if not result.get("hasMore") or not next_token:
+            matched_item_count += 1
+        next_token_raw = str(result.get("nextToken") or "").strip() or None
+        has_more = bool(result.get("hasMore"))
+        if not has_more and not next_token_raw:
             break
+        page_index += 1
+        next_token = next_token_raw
 
+    detail_lookup_count = 0
     for recipient in message.recipients:
-        if recipient.provider_message_id and recipient.status == "발송중":
+        if recipient.provider_message_id and recipient.status not in SMS_FINAL_RECIPIENT_STATUSES:
             detail = provider.get_message(message_id=recipient.provider_message_id)
+            detail_lookup_count += 1
             detail_items = detail.get("messages") or []
             if detail_items:
                 apply_sms_delivery_result(recipient, detail_items[0])
 
     update_sms_message_counts(message)
+    unresolved_recipients = [item for item in message.recipients if item.status not in SMS_FINAL_RECIPIENT_STATUSES]
+    unresolved_without_provider_id = [item for item in unresolved_recipients if not item.provider_message_id]
+    logger.info(
+        "SMS sync summary message_id=%s request_id=%s pages=%s provider_items=%s matched_items=%s unmatched_items=%s detail_lookups=%s unresolved=%s success=%s fail=%s status=%s",
+        message.id,
+        message.provider_request_id,
+        page_count,
+        provider_item_count,
+        matched_item_count,
+        unmatched_item_count,
+        detail_lookup_count,
+        len(unresolved_recipients),
+        message.success_count,
+        message.fail_count,
+        message.status,
+    )
+    if unmatched_item_count:
+        logger.warning(
+            "SMS sync had unmatched provider items for message_id=%s request_id=%s unmatched_items=%s",
+            message.id,
+            message.provider_request_id,
+            unmatched_item_count,
+        )
+    if unresolved_without_provider_id:
+        logger.warning(
+            "SMS sync left unresolved recipients without provider message ids for message_id=%s request_id=%s unresolved=%s",
+            message.id,
+            message.provider_request_id,
+            len(unresolved_without_provider_id),
+        )
     db.commit()
     return get_sms_message_or_404(db, message.id)
 
@@ -2094,7 +2248,7 @@ def sync_sms_message_runtime_state(
         return message
     if message.scheduled_at and message.status == "예약":
         return sync_sms_schedule_status(db, message_id, provider)
-    if message.status == "발송중":
+    if should_sync_sms_runtime_state(message):
         return sync_sms_message_delivery(db, message_id, provider)
     return message
 
@@ -2490,7 +2644,13 @@ def query_sms_history(db: Session, page: int, size: int) -> tuple[list[models.Sm
     pending_ids = db.scalars(
         select(models.SmsMessage.id).where(
             models.SmsMessage.provider_request_id.is_not(None),
-            models.SmsMessage.status.in_(SMS_SCHEDULE_SYNC_STATUSES),
+            or_(
+                models.SmsMessage.status.in_(SMS_SCHEDULE_SYNC_STATUSES),
+                and_(
+                    models.SmsMessage.status.not_in(SMS_HISTORY_EXCLUDED_STATUSES),
+                    models.SmsMessage.success_count + models.SmsMessage.fail_count < models.SmsMessage.target_count,
+                ),
+            ),
         )
     ).all()
     for message_id in pending_ids:
@@ -2513,7 +2673,7 @@ def query_sms_message_recipients(
     db: Session, message_id: int, keyword: str | None, page: int, size: int
 ) -> tuple[models.SmsMessage, list[models.SmsMessageRecipient], int]:
     message = get_sms_message_or_404(db, message_id)
-    if message.provider_request_id and message.status in SMS_SCHEDULE_SYNC_STATUSES:
+    if should_sync_sms_runtime_state(message):
         try:
             message = sync_sms_message_runtime_state(db, message_id)
         except Exception:
