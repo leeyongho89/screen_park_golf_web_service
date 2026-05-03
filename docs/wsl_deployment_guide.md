@@ -249,6 +249,7 @@ docker compose exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /docker-
 
 - `deploy/wsl/start-screen-golf.sh`
 - `deploy/wsl/stop-screen-golf.sh`
+- `deploy/wsl/backup-db.sh`
 - `deploy/wsl/screen-golf.service.example`
 - `deploy/wsl/screen-golf-wsl-keepalive.service.example`
 
@@ -258,6 +259,7 @@ docker compose exec -T db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /docker-
 cd /opt/screen_park_golf_service
 chmod +x deploy/wsl/start-screen-golf.sh
 chmod +x deploy/wsl/stop-screen-golf.sh
+chmod +x deploy/wsl/backup-db.sh
 ```
 
 systemd 서비스 등록:
@@ -387,6 +389,13 @@ cd /opt/screen_park_golf_service
 docker compose down
 ```
 
+DB 백업:
+
+```bash
+cd /opt/screen_park_golf_service
+deploy/wsl/backup-db.sh
+```
+
 systemd 재시작:
 
 ```bash
@@ -506,3 +515,24 @@ vmIdleTimeout=0
 - `5173` -> frontend
 
 다른 서비스가 이미 쓰고 있으면 `docker-compose.yml`의 포트 매핑을 바꿔야 합니다.
+
+### 7) `RWLayer ... is unexpectedly nil`
+
+원인:
+
+- Docker/WSL 종료 중 컨테이너 writable layer 메타데이터가 깨짐
+- Windows 강제 종료, 절전, Docker Desktop/WSL 비정상 종료
+
+조치:
+
+```bash
+cd /opt/screen_park_golf_service
+docker compose rm -f db
+docker compose up -d
+```
+
+주의:
+
+- 이 상황에서는 컨테이너만 재생성합니다.
+- 운영 데이터가 있으면 `docker compose down -v`를 실행하지 않습니다.
+- 복구 뒤 `deploy/wsl/backup-db.sh`로 백업이 정상 생성되는지 확인합니다.

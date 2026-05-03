@@ -57,6 +57,29 @@ Docker 환경에서 바로 실행:
 docker compose run --rm --no-deps frontend npm test
 ```
 
+## DB 백업과 안전 복구
+
+운영 데이터가 들어간 뒤에는 DB 백업을 먼저 만든 뒤 배포, 이관, 장애 조치를 진행합니다.
+
+```bash
+deploy/wsl/backup-db.sh
+```
+
+백업 파일은 `backups/screen_golf_YYYYMMDD_HHMMSS.dump` 형식으로 저장되며 Git에는 커밋되지 않습니다. 파일 권한은 소유자만 읽고 쓸 수 있게 생성됩니다. 배포 경로가 다르면 아래처럼 지정할 수 있습니다.
+
+```bash
+PROJECT_DIR=/opt/screen_park_golf_service /opt/screen_park_golf_service/deploy/wsl/backup-db.sh
+```
+
+Docker/WSL 레이어 오류가 발생하면 DB 볼륨을 지우지 말고 컨테이너만 재생성합니다.
+
+```bash
+docker compose rm -f db
+docker compose up -d
+```
+
+`docker compose down -v`는 PostgreSQL 데이터 볼륨까지 삭제하므로 운영 데이터가 있으면 사용하지 않습니다. 자세한 절차는 [DB 백업 및 복구 가이드](docs/db_backup_and_recovery.md)를 확인하세요.
+
 ## 다른 WSL 환경 배포
 
 다른 PC의 WSL 2 환경에 옮겨 배포하고, Windows 재부팅 후 자동 실행까지 설정하려면 아래 문서를 기준으로 진행합니다.
