@@ -35,8 +35,69 @@ is_recoverable_layer_error() {
     [[ "$text" == *"rwlayer"* || "$text" == *"snapshot not found"* || "$text" == *"unexpectedly nil"* ]]
 }
 
-get_db_state_error() {
-    docker inspect -f '{{.State.Error}}' "$DB_CONTAINER" 2>/dev/null || true
+get_compose_container_names() {
+    docker compose ps -a --format '{{.Name}}'
+}
+
+get_compose_service_for_container() {
+    local container_name="$1"
+    local name
+    local service
+
+    while read -r name service; do
+        if [[ "$name" == "$container_name" ]]; then
+            printf '%s\n' "$service"
+            return 0
+        fi
+    done < <(docker compose ps -a --format '{{.Name}} {{.Service}}')
+}
+
+is_compose_container() {
+    local container_name="$1"
+    local name
+
+    while read -r name; do
+        if [[ "$name" == "$container_name" ]]; then
+            return 0
+        fi
+    done < <(get_compose_container_names)
+
+    return 1
+}
+
+print_recoverable_container_from_id() {
+    local container_id="$1"
+    local container_name
+
+    container_name="$(docker inspect -f '{{.Name}}' "$container_id" 2>/dev/null || true)"
+    container_name="${container_name#/}"
+
+    if [[ -n "$container_name" ]] && is_compose_container "$container_name"; then
+        printf '%s\n' "$container_name"
+    fi
+}
+
+get_recoverable_layer_containers() {
+    local compose_error_log="$1"
+    local container_id
+    local container_name
+    local state_error
+
+    {
+        if [[ -s "$compose_error_log" ]] && is_recoverable_layer_error "$(cat "$compose_error_log")"; then
+            while read -r container_id; do
+                print_recoverable_container_from_id "$container_id"
+            done < <(grep -Eo 'container [0-9a-f]{12,64}' "$compose_error_log" | awk '{print $2}' | sort -u)
+        fi
+
+        while read -r container_name; do
+            state_error="$(docker inspect -f '{{.State.Error}}' "$container_name" 2>/dev/null || true)"
+            if [[ -n "$state_error" ]] && is_recoverable_layer_error "$state_error"; then
+                log_recovery "inspect state error for ${container_name}: ${state_error}"
+                printf '%s\n' "$container_name"
+            fi
+        done < <(get_compose_container_names)
+    } | sort -u
 }
 
 db_container_uses_named_data_volume() {
@@ -60,80 +121,95 @@ db_container_uses_named_data_volume() {
     return 0
 }
 
-detect_db_layer_error() {
-    local compose_error_log="$1"
-    local state_error
+container_has_named_volume() {
+    local container_name="$1"
 
-    if [[ -s "$compose_error_log" ]] && is_recoverable_layer_error "$(cat "$compose_error_log")"; then
+    [[ -n "$(docker inspect -f '{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}' "$container_name" 2>/dev/null || true)" ]]
+}
+
+container_can_be_recreated() {
+    local service="$1"
+    local container_name="$2"
+
+    if [[ "$service" == "$DB_SERVICE" || "$container_name" == "$DB_CONTAINER" ]]; then
+        db_container_uses_named_data_volume
         return 0
     fi
 
-    state_error="$(get_db_state_error)"
-    if [[ -n "$state_error" ]] && is_recoverable_layer_error "$state_error"; then
-        log_recovery "inspect state error: ${state_error}"
+    if ! container_has_named_volume "$container_name"; then
         return 0
     fi
 
+    log_recovery "aborted: ${container_name} has a named Docker volume and is not configured for automatic recovery."
+    echo "Refusing automatic recovery for ${container_name} because it has a named Docker volume." >&2
     return 1
 }
 
-remove_db_container_only() {
-    if docker compose rm -f "$DB_SERVICE" >> "$RECOVERY_LOG" 2>&1; then
-        log_recovery "action: docker compose rm -f ${DB_SERVICE} completed."
+remove_compose_container_only() {
+    local service="$1"
+    local container_name="$2"
+
+    if docker compose rm -f "$service" >> "$RECOVERY_LOG" 2>&1; then
+        log_recovery "action: docker compose rm -f ${service} completed."
     else
-        log_recovery "warning: docker compose rm -f ${DB_SERVICE} failed; trying docker rm -f ${DB_CONTAINER}."
+        log_recovery "warning: docker compose rm -f ${service} failed; trying docker rm -f ${container_name}."
     fi
 
-    if docker inspect "$DB_CONTAINER" >/dev/null 2>&1; then
-        if docker rm -f "$DB_CONTAINER" >> "$RECOVERY_LOG" 2>&1; then
-            log_recovery "action: docker rm -f ${DB_CONTAINER} completed."
+    if docker inspect "$container_name" >/dev/null 2>&1; then
+        if docker rm -f "$container_name" >> "$RECOVERY_LOG" 2>&1; then
+            log_recovery "action: docker rm -f ${container_name} completed."
         else
-            log_recovery "failed: docker rm -f ${DB_CONTAINER}."
-            echo "Failed to remove ${DB_CONTAINER}; see ${RECOVERY_LOG}." >&2
+            log_recovery "failed: docker rm -f ${container_name}."
+            echo "Failed to remove ${container_name}; see ${RECOVERY_LOG}." >&2
             return 1
         fi
     fi
 }
 
-recover_db_layer_and_start() {
+recover_layer_and_start() {
     local compose_error_log="$1"
+    local containers=()
+    local container_name
+    local service
 
-    if ! detect_db_layer_error "$compose_error_log"; then
+    mapfile -t containers < <(get_recoverable_layer_containers "$compose_error_log")
+    if (( ${#containers[@]} == 0 )); then
         return 1
     fi
 
-    log_recovery "detected: recoverable Docker DB container layer error."
+    log_recovery "detected: recoverable Docker container layer error."
     log_recovery_file_tail "$compose_error_log"
 
-    if ! db_container_uses_named_data_volume; then
-        echo "Refusing automatic DB container recovery because the Postgres named volume could not be verified." >&2
-        return 1
-    fi
+    for container_name in "${containers[@]}"; do
+        service="$(get_compose_service_for_container "$container_name")"
+        if [[ -z "$service" ]]; then
+            log_recovery "aborted: could not resolve compose service for ${container_name}."
+            echo "Refusing automatic recovery because the Compose service for ${container_name} could not be resolved." >&2
+            return 1
+        fi
 
-    echo "Recovering ${DB_CONTAINER} container layer while preserving the Postgres named volume." >&2
-    if ! remove_db_container_only; then
-        return 1
-    fi
+        if ! container_can_be_recreated "$service" "$container_name"; then
+            return 1
+        fi
 
-    if docker compose up -d "$DB_SERVICE" >> "$RECOVERY_LOG" 2>&1; then
-        log_recovery "action: docker compose up -d ${DB_SERVICE} completed."
-    else
-        log_recovery "failed: docker compose up -d ${DB_SERVICE}."
-        echo "Failed to recreate ${DB_CONTAINER}; see ${RECOVERY_LOG}." >&2
-        return 1
-    fi
+        echo "Recovering ${container_name} container layer for service ${service}." >&2
+        log_recovery "recovering: ${container_name} (${service})."
+        if ! remove_compose_container_only "$service" "$container_name"; then
+            return 1
+        fi
+    done
 
     if docker compose up -d >> "$RECOVERY_LOG" 2>&1; then
-        log_recovery "action: docker compose up -d completed after DB container recovery."
+        log_recovery "action: docker compose up -d completed after container layer recovery."
         return 0
     fi
 
-    log_recovery "failed: docker compose up -d after DB container recovery."
-    echo "Failed to start all services after ${DB_CONTAINER} recovery; see ${RECOVERY_LOG}." >&2
+    log_recovery "failed: docker compose up -d after container layer recovery."
+    echo "Failed to start all services after container layer recovery; see ${RECOVERY_LOG}." >&2
     return 1
 }
 
-compose_up_with_db_layer_recovery() {
+compose_up_with_layer_recovery() {
     local compose_error_log
     local compose_status
 
@@ -146,7 +222,7 @@ compose_up_with_db_layer_recovery() {
     compose_status=$?
     cat "$compose_error_log" >&2
 
-    if recover_db_layer_and_start "$compose_error_log"; then
+    if recover_layer_and_start "$compose_error_log"; then
         rm -f "$compose_error_log"
         return 0
     fi
@@ -211,7 +287,7 @@ wait_for_http() {
 }
 
 wait_for_docker
-compose_up_with_db_layer_recovery
+compose_up_with_layer_recovery
 wait_for_container_health "screen-golf-db"
 wait_for_container_health "screen-golf-backend"
 wait_for_container_health "screen-golf-frontend"

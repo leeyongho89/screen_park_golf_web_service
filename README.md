@@ -71,11 +71,10 @@ deploy/wsl/backup-db.sh
 PROJECT_DIR=/opt/screen_park_golf_service /opt/screen_park_golf_service/deploy/wsl/backup-db.sh
 ```
 
-Docker/WSL 레이어 오류가 발생하면 DB 볼륨을 지우지 말고 컨테이너만 재생성합니다.
+Docker/WSL 레이어 오류가 발생하면 DB 볼륨을 지우지 말고 손상된 컨테이너만 재생성합니다. Windows 시작 스크립트와 systemd 서비스는 `RWLayer`, `snapshot not found`, `unexpectedly nil` 오류를 감지해 Compose 컨테이너를 자동 재생성합니다.
 
 ```bash
-docker compose rm -f db
-docker compose up -d
+deploy/wsl/start-screen-golf.sh
 ```
 
 `docker compose down -v`는 PostgreSQL 데이터 볼륨까지 삭제하므로 운영 데이터가 있으면 사용하지 않습니다. 자세한 절차는 [DB 백업 및 복구 가이드](docs/db_backup_and_recovery.md)를 확인하세요.
